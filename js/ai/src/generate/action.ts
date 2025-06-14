@@ -322,12 +322,27 @@ async function generate(
         );
       };
 
-      return new GenerateResponse(await dispatch(0, request), {
+      const modelResponse = await dispatch(0, request);
+
+      if (model.__action.actionType === 'background-model') {
+        return new GenerateResponse(
+          { operation: modelResponse },
+          {
+            request,
+            parser: format?.handler(request.output?.schema).parseMessage,
+          }
+        );
+      }
+
+      return new GenerateResponse(modelResponse, {
         request,
         parser: format?.handler(request.output?.schema).parseMessage,
       });
     }
   );
+  if (model.__action.actionType === 'background-model') {
+    return response.toJSON();
+  }
 
   // Throw an error if the response is not usable.
   response.assertValid();
