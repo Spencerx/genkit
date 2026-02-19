@@ -467,7 +467,7 @@ ai.defineFlow('gemini-image-editing', async (_) => {
   const room = fs.readFileSync('my_room.png', { encoding: 'base64' });
 
   const { media } = await ai.generate({
-    model: googleAI.model('gemini-2.5-flash-image-preview'),
+    model: googleAI.model('gemini-2.5-flash-image'),
     prompt: [
       { text: 'add the plant to my room' },
       { media: { url: `data:image/png;base64,${plant}` } },
@@ -749,23 +749,6 @@ async function downloadVideo(video: MediaPart, path: string) {
 
   Readable.from(videoDownloadResponse.body).pipe(fs.createWriteStream(path));
 }
-
-// Test external URL with Gemini 2.0 (should download and inline)
-ai.defineFlow('external-url-gemini-2.0', async () => {
-  const { text } = await ai.generate({
-    model: googleAI.model('gemini-2.0-flash'),
-    prompt: [
-      { text: 'Describe this image.' },
-      {
-        media: {
-          url: 'https://storage.googleapis.com/generativeai-downloads/images/scones.jpg',
-          contentType: 'image/jpeg',
-        },
-      },
-    ],
-  });
-  return text;
-});
 
 // Test external URL with Gemini 3.0 (should pass as fileUri)
 ai.defineFlow('external-url-gemini-3.0', async () => {
