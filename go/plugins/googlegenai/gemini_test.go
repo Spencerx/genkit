@@ -223,8 +223,19 @@ func TestConvertRequest(t *testing.T) {
 				},
 				err: errors.New("system instruction should be set using Genkit features"),
 			},
-			// Note: FunctionDeclarations in config.Tools are now allowed and merged
-			// with ai.WithTools() declarations instead of being rejected.
+			{
+				name: "use custom function tools outside genkit",
+				cfg: genai.GenerateContentConfig{
+					Tools: []*genai.Tool{
+						{
+							FunctionDeclarations: []*genai.FunctionDeclaration{
+								{Name: "myCustomTool", Description: "x"},
+							},
+						},
+					},
+				},
+				err: errors.New("custom function tools should be set using Genkit features"),
+			},
 			{
 				name: "use cache outside genkit",
 				cfg: genai.GenerateContentConfig{
@@ -585,23 +596,48 @@ func TestToolMerging(t *testing.T) {
 		}
 	})
 
-	t.Run("merges FunctionDeclarations from config with Genkit tools", func(t *testing.T) {
-		// This tests the case where FunctionDeclarations exist in both
-		// config.Tools AND input.Tools - they should all be merged.
-		configFuncDecl := &genai.FunctionDeclaration{
-			Name:        "config_function",
-			Description: "A function from config",
-		}
-
+	t.Run("rejects FunctionDeclarations in config tools", func(t *testing.T) {
+		// Custom function tools must go through ai.WithTools() so they are
+		// registered with the Genkit tool registry. Passing them via config
+		// would skip registration and the model would call something with no
+		// handler attached.
 		req := &ai.ModelRequest{
 			Config: genai.GenerateContentConfig{
 				Temperature: genai.Ptr[float32](0.5),
 				Tools: []*genai.Tool{
 					{
-						FunctionDeclarations: []*genai.FunctionDeclaration{configFuncDecl},
-						GoogleSearch:         &genai.GoogleSearch{}, // hybrid tool
+						FunctionDeclarations: []*genai.FunctionDeclaration{
+							{Name: "config_function", Description: "A function from config"},
+						},
+						GoogleSearch: &genai.GoogleSearch{},
 					},
 				},
+			},
+			Tools: []*ai.ToolDefinition{genkitTool},
+			Messages: []*ai.Message{
+				{Role: ai.RoleUser, Content: []*ai.Part{{Text: "test"}}},
+			},
+		}
+
+		if _, err := toGeminiRequest(req, nil); err == nil {
+			t.Fatal("expected error rejecting FunctionDeclarations in config tools, got nil")
+		}
+	})
+
+	t.Run("preserves user ToolConfig when no ToolChoice is set", func(t *testing.T) {
+		// Regression: passing ai.WithTools() without ai.WithToolChoice() used
+		// to clobber gcc.ToolConfig to nil, dropping any RetrievalConfig or
+		// IncludeServerSideToolInvocations the user supplied.
+		userToolConfig := &genai.ToolConfig{
+			RetrievalConfig: &genai.RetrievalConfig{
+				LanguageCode: "en-US",
+			},
+			IncludeServerSideToolInvocations: genai.Ptr(true),
+		}
+		req := &ai.ModelRequest{
+			Config: genai.GenerateContentConfig{
+				Temperature: genai.Ptr[float32](0.5),
+				ToolConfig:  userToolConfig,
 			},
 			Tools: []*ai.ToolDefinition{genkitTool},
 			Messages: []*ai.Message{
@@ -613,29 +649,14 @@ func TestToolMerging(t *testing.T) {
 		if err != nil {
 			t.Fatalf("toGeminiRequest failed: %v", err)
 		}
-
-		// Should have: 1 tool with all FunctionDeclarations, 1 tool with GoogleSearch
-		hasGoogleSearch := false
-		funcDeclCount := 0
-		var funcNames []string
-
-		for _, tool := range gcc.Tools {
-			if tool.GoogleSearch != nil {
-				hasGoogleSearch = true
-			}
-			if tool.FunctionDeclarations != nil {
-				for _, fd := range tool.FunctionDeclarations {
-					funcDeclCount++
-					funcNames = append(funcNames, fd.Name)
-				}
-			}
+		if gcc.ToolConfig == nil {
+			t.Fatal("ToolConfig was dropped; expected user-supplied fields to be preserved")
 		}
-
-		if !hasGoogleSearch {
-			t.Error("GoogleSearch was dropped during merge")
+		if gcc.ToolConfig.RetrievalConfig == nil || gcc.ToolConfig.RetrievalConfig.LanguageCode != "en-US" {
+			t.Errorf("RetrievalConfig not preserved: %#v", gcc.ToolConfig.RetrievalConfig)
 		}
-		if funcDeclCount != 2 {
-			t.Errorf("expected 2 function declarations (1 from config + 1 from input.Tools), got %d: %v", funcDeclCount, funcNames)
+		if gcc.ToolConfig.IncludeServerSideToolInvocations == nil || !*gcc.ToolConfig.IncludeServerSideToolInvocations {
+			t.Errorf("IncludeServerSideToolInvocations not preserved: %#v", gcc.ToolConfig.IncludeServerSideToolInvocations)
 		}
 	})
 }
