@@ -44,7 +44,6 @@ import {
   GenerateContentRequest,
   GenerateContentResponse,
   GoogleSearchRetrieval,
-  GoogleSearchRetrievalTool,
   Model,
   Tool,
   ToolConfig,
@@ -426,6 +425,8 @@ const GENERIC_IMAGE_MODEL = commonRef(
 );
 
 export const KNOWN_GEMINI_MODELS = {
+  'gemini-flash-latest': commonRef('gemini-flash-latest'),
+  'gemini-flash-lite-latest': commonRef('gemini-flash-lite-latest'),
   'gemini-3.5-flash': commonRef('gemini-3.5-flash'),
   'gemini-3.1-flash-lite-preview': commonRef('gemini-3.1-flash-lite-preview'),
   'gemini-3.1-pro-preview': commonRef('gemini-3.1-pro-preview'),
@@ -674,17 +675,9 @@ export function defineModel(
       }
 
       if (googleSearchRetrieval) {
-        // Gemini 1.5 models use googleSearchRetrieval, newer models use googleSearch.
-        if (ref.name.startsWith('vertexai/gemini-1.5')) {
-          tools.push({
-            googleSearchRetrieval:
-              googleSearchRetrieval as GoogleSearchRetrieval,
-          } as GoogleSearchRetrievalTool);
-        } else {
-          tools.push({
-            googleSearch: googleSearchRetrieval as GoogleSearchRetrieval,
-          } as GoogleSearchRetrievalTool);
-        }
+        tools.push({
+          googleSearch: googleSearchRetrieval as GoogleSearchRetrieval,
+        });
       }
 
       if (vertexRetrieval) {
