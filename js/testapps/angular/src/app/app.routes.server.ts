@@ -1,5 +1,5 @@
 /**
- * Copyright 2024 Google LLC
+ * Copyright 2026 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,22 +14,11 @@
  * limitations under the License.
  */
 
-import type { Formatter } from './types.js';
+import { RenderMode, ServerRoute } from '@angular/ssr';
 
-export const textFormatter: Formatter<string, string> = {
-  name: 'text',
-  config: {
-    contentType: 'text/plain',
+export const serverRoutes: ServerRoute[] = [
+  {
+    path: '**',
+    renderMode: RenderMode.Client,
   },
-  handler: () => {
-    return {
-      parseChunk: (chunk) => {
-        return chunk.text;
-      },
-
-      parseMessage: (message) => {
-        return message.text;
-      },
-    };
-  },
-};
+];

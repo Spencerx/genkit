@@ -1,5 +1,5 @@
 /**
- * Copyright 2024 Google LLC
+ * Copyright 2025 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,22 +14,10 @@
  * limitations under the License.
  */
 
-import type { Formatter } from './types.js';
+import { googleAI } from '@genkit-ai/google-genai';
+import { genkit } from 'genkit';
 
-export const textFormatter: Formatter<string, string> = {
-  name: 'text',
-  config: {
-    contentType: 'text/plain',
-  },
-  handler: () => {
-    return {
-      parseChunk: (chunk) => {
-        return chunk.text;
-      },
-
-      parseMessage: (message) => {
-        return message.text;
-      },
-    };
-  },
-};
+export const ai = genkit({
+  plugins: [googleAI()],
+  model: googleAI.model('gemini-flash-latest'),
+});
