@@ -667,10 +667,6 @@ export function defineModel(
 
   const middleware: ModelMiddleware[] = [];
   if (ref.info?.supports?.media) {
-    // For Gemini 2.0, external URLs are not supported, so we must download.
-    // For newer models, we can pass the URL directly.
-    const supportsExternalUrls = !name.startsWith('gemini-2.0');
-
     middleware.push(
       downloadRequestMedia({
         maxBytes: MAX_INLINE_MEDIA_BYTES,
@@ -679,22 +675,8 @@ export function defineModel(
         filter: (part) => {
           try {
             const url = new URL(part.media.url);
-            if (
-              // Gemini can handle these URLs
-              [
-                'generativelanguage.googleapis.com',
-                'www.youtube.com',
-                'youtube.com',
-                'youtu.be',
-              ].includes(url.hostname)
-            )
-              return false;
-
-            // If model supports external URLs, allow http/https URLs to pass through
-            if (
-              supportsExternalUrls &&
-              (url.protocol === 'https:' || url.protocol === 'http:')
-            ) {
+            // Allow http/https URLs to pass through
+            if (url.protocol === 'https:' || url.protocol === 'http:') {
               return false;
             }
           } catch {}
