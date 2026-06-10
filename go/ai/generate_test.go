@@ -1630,7 +1630,7 @@ func TestMultipartTools(t *testing.T) {
 		}
 	})
 
-	t.Run("multipart tool returns content in response", func(t *testing.T) {
+	t.Run("multipart tool returns metadata and content in response", func(t *testing.T) {
 		r := registry.New()
 		ConfigureFormats(r)
 		DefineGenerateAction(context.Background(), r)
@@ -1638,7 +1638,8 @@ func TestMultipartTools(t *testing.T) {
 		multipartTool := DefineMultipartTool(r, "imageGenerator", "generates images",
 			func(ctx *ToolContext, input struct{ Prompt string }) (*MultipartToolResponse, error) {
 				return &MultipartToolResponse{
-					Output: map[string]any{"description": "generated image"},
+					Output:   map[string]any{"description": "generated image"},
+					Metadata: map[string]any{"size": 1},
 					Content: []*Part{
 						NewMediaPart("image/png", "data:image/png;base64,iVBORw0..."),
 					},
@@ -1653,7 +1654,10 @@ func TestMultipartTools(t *testing.T) {
 				if msg.Role == RoleTool {
 					for _, part := range msg.Content {
 						if part.IsToolResponse() {
-							// Verify the content is present
+							// Verify the metadata and content are present
+							if len(part.Metadata) == 0 {
+								return nil, fmt.Errorf("expected tool response to have metadata")
+							}
 							if len(part.ToolResponse.Content) == 0 {
 								return nil, fmt.Errorf("expected tool response to have content")
 							}
