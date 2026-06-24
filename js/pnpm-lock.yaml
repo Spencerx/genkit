@@ -682,6 +682,9 @@ importers:
 
   plugins/google-cloud:
     dependencies:
+      '@google-cloud/firestore':
+        specifier: ^7.11.0
+        version: 7.11.6(encoding@0.1.13)
       '@google-cloud/logging-winston':
         specifier: ^6.0.0
         version: 6.0.1(encoding@0.1.13)(winston@3.19.0)
@@ -727,9 +730,6 @@ importers:
       '@opentelemetry/sdk-trace-base':
         specifier: ~1.25.0
         version: 1.25.1(@opentelemetry/api@1.9.0)
-      genkit:
-        specifier: workspace:^
-        version: link:../../genkit
       google-auth-library:
         specifier: ^9.6.3
         version: 9.15.1(encoding@0.1.13)
@@ -743,9 +743,18 @@ importers:
       '@jest/globals':
         specifier: ^29.7.0
         version: 29.7.0
+      '@types/jest':
+        specifier: ^29.5.12
+        version: 29.5.14
       '@types/node':
         specifier: ^20.11.16
         version: 20.19.37
+      firebase-tools:
+        specifier: ^13.13.2
+        version: 13.35.1(@types/node@20.19.37)(encoding@0.1.13)
+      genkit:
+        specifier: workspace:*
+        version: link:../../genkit
       jest:
         specifier: ^29.7.0
         version: 29.7.0(@types/node@20.19.37)

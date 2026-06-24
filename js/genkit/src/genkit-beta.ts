@@ -25,6 +25,7 @@ import {
   definePromptAgent,
   defineResource,
   generateOperation,
+  type Agent,
   type AgentConfig,
   type AgentFn,
   type AgentStreamChunk,
@@ -52,12 +53,21 @@ import {
   InMemorySessionStore,
 } from '@genkit-ai/ai/session-stores';
 
+import { applyPatch, diff } from '@genkit-ai/ai/json-patch';
 import { type Operation, type z } from '@genkit-ai/core';
 import type { Formatter } from './formats.js';
 import { Genkit, type GenkitOptions } from './genkit.js';
 
-export { FileSessionStore, InMemorySessionStore, SessionRunner };
+export type { JsonPatch, JsonPatchOperation } from '@genkit-ai/ai/json-patch';
+export {
+  FileSessionStore,
+  InMemorySessionStore,
+  SessionRunner,
+  applyPatch,
+  diff,
+};
 export type {
+  Agent,
   AgentFn,
   AgentStreamChunk,
   ClientTransform,
