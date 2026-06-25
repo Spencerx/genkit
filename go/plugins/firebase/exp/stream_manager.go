@@ -14,11 +14,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-// Package x contains experimental Firebase features.
-//
-// APIs in this package are under active development and may change in any
-// minor version release. Use with caution in production environments.
-package x
+package exp
 
 import (
 	"context"
@@ -32,7 +28,6 @@ import (
 	"github.com/firebase/genkit/go/core"
 	"github.com/firebase/genkit/go/core/x/streaming"
 	"github.com/firebase/genkit/go/genkit"
-	"github.com/firebase/genkit/go/plugins/firebase"
 	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -40,46 +35,10 @@ import (
 
 const (
 	streamBufferSize = 100
-	defaultTimeout   = 60 * time.Second
 	streamEventChunk = "chunk"
 	streamEventDone  = "done"
 	streamEventError = "error"
 )
-
-// StreamManagerOption configures a FirestoreStreamManager.
-// Implemented by firestoreOptions (WithCollection, WithTTL) and streamManagerOptions (WithTimeout).
-type StreamManagerOption interface {
-	applyStreamManager(*streamManagerOptions) error
-}
-
-// streamManagerOptions holds configuration for FirestoreStreamManager.
-type streamManagerOptions struct {
-	firestoreOptions
-	Timeout time.Duration
-}
-
-// applyStreamManager implements StreamManagerOption for streamManagerOptions.
-func (o *streamManagerOptions) applyStreamManager(opts *streamManagerOptions) error {
-	if err := o.firestoreOptions.applyFirestore(&opts.firestoreOptions); err != nil {
-		return err
-	}
-
-	if o.Timeout > 0 {
-		if opts.Timeout > 0 {
-			return errors.New("cannot set timeout more than once (WithTimeout)")
-		}
-		opts.Timeout = o.Timeout
-	}
-
-	return nil
-}
-
-// WithTimeout sets how long a subscriber waits for new events before giving up.
-// If no activity occurs within this duration, subscribers receive a DEADLINE_EXCEEDED error.
-// Default is 60 seconds.
-func WithTimeout(timeout time.Duration) StreamManagerOption {
-	return &streamManagerOptions{Timeout: timeout}
-}
 
 // FirestoreStreamManager implements [streaming.StreamManager] using Firestore as the backend.
 // Stream state is persisted in Firestore documents, allowing streams to survive server
@@ -100,12 +59,18 @@ type streamDocument struct {
 }
 
 // streamEntry represents a single entry in the stream array.
+//
+// Chunk and Output are []byte rather than json.RawMessage: Firestore stores
+// either as a Bytes value, but its decoder only sets a Bytes value back into a
+// plain []byte field (decoding into the named json.RawMessage type fails with
+// "cannot set type json.RawMessage to bytes"). The json.RawMessage values from
+// the StreamInput API assign to and from []byte without conversion.
 type streamEntry struct {
-	Type   string          `firestore:"type"`
-	Chunk  json.RawMessage `firestore:"chunk,omitempty"`
-	Output json.RawMessage `firestore:"output,omitempty"`
-	Err    *streamError    `firestore:"err,omitempty"`
-	UUID   string          `firestore:"uuid,omitempty"`
+	Type   string       `firestore:"type"`
+	Chunk  []byte       `firestore:"chunk,omitempty"`
+	Output []byte       `firestore:"output,omitempty"`
+	Err    *streamError `firestore:"err,omitempty"`
+	UUID   string       `firestore:"uuid,omitempty"`
 }
 
 // streamError represents a serializable error for Firestore storage.
@@ -123,39 +88,28 @@ func NewFirestoreStreamManager(ctx context.Context, g *genkit.Genkit, opts ...St
 			return nil, fmt.Errorf("firebase.NewFirestoreStreamManager: error applying options: %w", err)
 		}
 	}
-	if streamOpts.Collection == "" {
+	if streamOpts.collection == "" {
 		return nil, errors.New("firebase.NewFirestoreStreamManager: Collection name is required.\n" +
 			"  Specify the Firestore collection where stream documents will be stored:\n" +
 			"    firebase.NewFirestoreStreamManager(ctx, g, firebase.WithCollection(\"genkit-streams\"))")
 	}
-	if streamOpts.Timeout == 0 {
-		streamOpts.Timeout = defaultTimeout
+	if streamOpts.timeout == 0 {
+		streamOpts.timeout = defaultTimeout
 	}
-	if streamOpts.TTL == 0 {
-		streamOpts.TTL = DefaultTTL
-	}
-
-	plugin := genkit.LookupPlugin(g, "firebase")
-	if plugin == nil {
-		return nil, errors.New("firebase.NewFirestoreStreamManager: Firebase plugin not found.\n" +
-			"  Pass the Firebase plugin to genkit.Init():\n" +
-			"    g := genkit.Init(ctx, genkit.WithPlugins(&firebase.Firebase{ProjectId: \"your-project\"}))")
-	}
-	f, ok := plugin.(*firebase.Firebase)
-	if !ok {
-		return nil, fmt.Errorf("firebase.NewFirestoreStreamManager: unexpected plugin type %T", plugin)
+	if streamOpts.ttl == 0 {
+		streamOpts.ttl = DefaultTTL
 	}
 
-	client, err := f.Firestore(ctx)
+	client, err := resolveFirestoreClient(ctx, g)
 	if err != nil {
 		return nil, fmt.Errorf("firebase.NewFirestoreStreamManager: %w", err)
 	}
 
 	return &FirestoreStreamManager{
 		client:     client,
-		collection: streamOpts.Collection,
-		timeout:    streamOpts.Timeout,
-		ttl:        streamOpts.TTL,
+		collection: streamOpts.collection,
+		timeout:    streamOpts.timeout,
+		ttl:        streamOpts.ttl,
 	}, nil
 }
 
@@ -444,6 +398,11 @@ func (s *firestoreStreamInput) Error(ctx context.Context, err error) error {
 	var ufErr *core.UserFacingError
 	if errors.As(err, &ufErr) {
 		streamErr.Status = string(ufErr.Status)
+		// Store the bare message, not err.Error(): a UserFacingError stringifies
+		// as "STATUS: message", and the status is already carried separately. This
+		// keeps the persisted message clean and prevents the Subscribe path (which
+		// rebuilds the error from status + message) from double-prefixing it.
+		streamErr.Message = ufErr.Message
 	}
 
 	expiresAt := time.Now().Add(s.manager.ttl)
