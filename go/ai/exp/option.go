@@ -111,6 +111,11 @@ type agentOptions[State any] struct {
 	transform       StateTransform[State]
 	streamTransform StreamTransform
 	description     string
+	// contextFunc decorates each invocation's context once before the turn
+	// loop runs. It has no public option: the registry-level constructors set
+	// it internally to seed the genkit instance (see genkitContextSeed in
+	// agent.go), so callers reach the instance via genkit.FromContext.
+	contextFunc func(context.Context) context.Context
 }
 
 func (o *agentOptions[State]) applyAgent(opts *agentOptions[State]) error {
@@ -137,6 +142,12 @@ func (o *agentOptions[State]) applyAgent(opts *agentOptions[State]) error {
 			return errors.New("cannot set description more than once (WithDescription)")
 		}
 		opts.description = o.description
+	}
+	if o.contextFunc != nil {
+		// Seeded internally by the registry-level constructors
+		// (genkitContextSeed), at most once per agent, so this is a plain set
+		// rather than a compose of multiple decorators.
+		opts.contextFunc = o.contextFunc
 	}
 	return nil
 }

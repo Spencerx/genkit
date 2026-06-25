@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// This sample demonstrates Genkit's agent APIs by defining four agents in
+// This sample demonstrates Genkit's agent APIs by defining five agents in
 // different styles and exposing all of them through a single CLI:
 //
 //   - "pirate" uses DefineAgent + aix.InlinePrompt. The prompt is declared
@@ -27,9 +27,13 @@
 //     mid-turn to ask the user for approval before moving money, then
 //     resumes the tool with their answer. This exercises the tool
 //     interrupt / resume flow through the same CLI.
+//   - "orchestrator" uses the experimental Agents middleware to delegate to
+//     specialized sub-agents (researcher, engineer) through per-agent tools,
+//     merging their artifacts into its own session. See orchestrator.go.
 //
-// All agents persist their conversation state to a per-agent
-// FileSessionStore under ./.genkit/snapshots/<agent>/.
+// The first four agents persist their conversation state to a per-agent
+// FileSessionStore under ./.genkit/snapshots/<agent>/; the orchestrator does
+// too, while its sub-agents run statelessly per delegation.
 //
 // To run:
 //
@@ -108,6 +112,7 @@ func main() {
 		{agent: definePromptAgent(g)},
 		{agent: defineCustomAgent(g)},
 		{agent: defineBankerAgent(g), onInterrupt: handleTransferInterrupt},
+		{agent: defineOrchestratorAgent(g)},
 	}
 
 	if err := runCLI(ctx, agents); err != nil {
