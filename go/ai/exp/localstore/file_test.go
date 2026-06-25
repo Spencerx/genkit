@@ -384,8 +384,13 @@ func TestFileSessionStore(t *testing.T) {
 			}); err != nil {
 			t.Fatalf("SaveSnapshot: %v", err)
 		}
-		if _, err := os.Stat(filepath.Join(dir, "snap-1.json")); err != nil {
-			t.Errorf("expected snap-1.json on disk: %v", err)
+		// With no prefix configured the snapshot defaults to the "global"
+		// subdirectory, never the bare store root.
+		if _, err := os.Stat(filepath.Join(dir, "global", "snap-1.json")); err != nil {
+			t.Errorf("expected global/snap-1.json on disk: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(dir, "snap-1.json")); !os.IsNotExist(err) {
+			t.Errorf("snapshot must not land in store root, stat err = %v", err)
 		}
 	})
 
@@ -566,7 +571,10 @@ func TestFileSessionStore_GetLatestSnapshot_SkipsUnparseableFiles(t *testing.T) 
 		}); err != nil {
 		t.Fatalf("SaveSnapshot: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "junk.json"), []byte("{not json"), 0o600); err != nil {
+	// Drop the junk file alongside the healthy row (under the default "global"
+	// prefix, the directory GetLatestSnapshot scans) so it is genuinely in the
+	// scan path rather than an unscanned sibling.
+	if err := os.WriteFile(filepath.Join(dir, "global", "junk.json"), []byte("{not json"), 0o600); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
@@ -758,6 +766,41 @@ func TestFileSessionStore_PathPrefix_Rejected(t *testing.T) {
 			}
 			if _, err := store.GetLatestSnapshot(ctx, "sess"); err == nil {
 				t.Error("GetLatestSnapshot: expected error for escaping prefix, got nil")
+			}
+		})
+	}
+}
+
+// TestFileSessionStore_PathPrefix_EmptyRejected verifies that a configured prefix
+// function returning an empty or separator-only value is rejected at call time.
+// The default "global" prefix is requested by omitting the option, not by
+// returning an empty value from it.
+func TestFileSessionStore_PathPrefix_EmptyRejected(t *testing.T) {
+	cases := []struct{ name, prefix string }{
+		{"empty", ""},
+		{"single slash", "/"},
+		{"multiple slashes", "///"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			store, err := NewFileSessionStore[testState](dir,
+				WithSnapshotPathPrefix(func(context.Context) string { return tc.prefix }))
+			if err != nil {
+				t.Fatalf("NewFileSessionStore: %v", err)
+			}
+			ctx := context.Background()
+			if _, err := store.SaveSnapshot(ctx, "s1",
+				func(_ *exp.SessionSnapshot[testState]) (*exp.SessionSnapshot[testState], error) {
+					return &exp.SessionSnapshot[testState]{SessionID: "sess"}, nil
+				}); err == nil {
+				t.Error("SaveSnapshot: expected error for empty prefix, got nil")
+			}
+			if _, err := store.GetSnapshot(ctx, "s1"); err == nil {
+				t.Error("GetSnapshot: expected error for empty prefix, got nil")
+			}
+			if _, err := store.GetLatestSnapshot(ctx, "sess"); err == nil {
+				t.Error("GetLatestSnapshot: expected error for empty prefix, got nil")
 			}
 		})
 	}

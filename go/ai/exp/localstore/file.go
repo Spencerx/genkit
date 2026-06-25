@@ -35,16 +35,22 @@ import (
 
 // FileSessionStore is a snapshot store that persists snapshots as JSON files on
 // the local filesystem. Each snapshot is written to its own file named
-// "<snapshotID>.json", under an optional per-call subdirectory ("prefix"):
+// "<snapshotID>.json", under a per-call subdirectory ("prefix"):
 //
 //	<dir>/<prefix>/<snapshotID>.json
+//
+// The prefix is derived from each call's context (see [WithSnapshotPathPrefix])
+// and defaults to "global" when none is configured; snapshots therefore always
+// live under a subdirectory, never directly in the store root. That default
+// places every session in one shared "global" directory, so pass
+// [WithSnapshotPathPrefix] to scope them per tenant when identifiers could
+// repeat across users (e.g. per-user session IDs).
 //
 // The snapshot ID is the primary key: GetSnapshot, the by-ID SaveSnapshot
 // (heartbeat, abort, finalize), and OnSnapshotStatusChange all open that file
 // directly. GetLatestSnapshot, the only by-session lookup, scans the prefix
 // directory and selects the most-recently-created row for the session. The
-// prefix is derived from each call's context (see [WithSnapshotPathPrefix]), so
-// it is always known on a by-ID call - unlike the session ID, which a by-ID
+// prefix is always known on a by-ID call - unlike the session ID, which a by-ID
 // caller does not have. That is why snapshots are grouped by prefix and kept
 // flat within it rather than nested under a per-session directory.
 //
@@ -98,6 +104,13 @@ type snapshotSubs struct {
 // interval so an operator-driven abort propagates promptly while the idle I/O
 // cost stays negligible.
 const defaultPollInterval = time.Second * 2
+
+// defaultPrefix is the per-call subdirectory snapshots are written under when no
+// [WithSnapshotPathPrefix] is configured, so snapshots always live at least one
+// level below the store root rather than directly in it. A configured function
+// must return a non-empty value: the default is requested by omitting the
+// option, not by returning an empty prefix.
+const defaultPrefix = "global"
 
 // NewFileSessionStore creates a file-based snapshot store rooted at dir.
 // The directory is created (mode 0o700) if it does not already exist.
@@ -353,15 +366,25 @@ func (s *FileSessionStore[State]) OnSnapshotStatusChange(ctx context.Context, sn
 	return ch
 }
 
-// derivePrefix resolves the per-call subdirectory snapshots live under by
-// invoking the configured prefix function (if any) and sanitizing its result.
-// Returns "" (the store root) when no function is configured or it yields an
-// empty value.
+// derivePrefix resolves the per-call subdirectory snapshots live under. With no
+// prefix function configured it returns [defaultPrefix] ("global"); otherwise it
+// sanitizes the function's result and requires it to be non-empty. As with every
+// other option, the default is requested by omitting [WithSnapshotPathPrefix],
+// not by returning an empty value from it, so an empty or separator-only result
+// is rejected rather than silently mapped to the default.
 func (s *FileSessionStore[State]) derivePrefix(ctx context.Context) (string, error) {
 	if s.prefixFn == nil {
-		return "", nil
+		return defaultPrefix, nil
 	}
-	return sanitizePrefix(s.prefixFn(ctx))
+	raw := s.prefixFn(ctx)
+	prefix, err := sanitizePrefix(raw)
+	if err != nil {
+		return "", err
+	}
+	if prefix == "" {
+		return "", fmt.Errorf("FileSessionStore: WithSnapshotPathPrefix returned %q, which is empty after normalization; omit the option to use the default %q prefix", raw, defaultPrefix)
+	}
+	return prefix, nil
 }
 
 // readAt reads and parses the snapshot file at path. Returns (nil, nil) if the
