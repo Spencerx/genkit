@@ -391,6 +391,36 @@ text, _ := genkit.GenerateText(ctx, g,
 fmt.Println(text)
 ```
 
+Options compose, so you can build a request up from several helpers. Options
+carrying multiple items (`ai.WithMessages`, `ai.WithTools`, `ai.WithDocs`,
+`ai.WithUse`) accumulate across repeats, while single-value options
+(`ai.WithConfig`, `ai.WithModelName`, `ai.WithSystem`) take the last one set.
+Repeating an option is never an error, so a request can be assembled in pieces:
+
+```go
+opts := []ai.GenerateOption{
+    ai.WithModelName("googleai/gemini-flash-latest"),
+    ai.WithSystem("You are a helpful assistant."),
+    ai.WithTools(searchTool, weatherTool),
+}
+
+if isAdmin {
+    // Appends to the tools above; the model sees all of them.
+    opts = append(opts, ai.WithTools(adminTools...))
+}
+if terse {
+    // Fills the same slot as the system prompt above, so this one wins.
+    opts = append(opts, ai.WithSystem("You are a terse assistant. One sentence."))
+}
+
+response, _ := genkit.Generate(ctx, g, append(opts, ai.WithPrompt("What should I pack for Tokyo?"))...)
+```
+
+Tool names must be unique across the merged list: repeating the same tool in
+two helpers is rejected when the request runs. These rules cover a single
+options list; APIs that layer two lists, like a prompt's define-time options
+against `Execute`-time options, document their own precedence.
+
 ### Generate Structured Data
 
 Get type-safe JSON output that maps directly to your Go structs:
@@ -536,18 +566,24 @@ resp, _ := genkit.Generate(ctx, g,
     ai.WithTools(transferTool),
 )
 
-if resp.FinishReason == ai.FinishReasonInterrupted {
-    for _, interrupt := range resp.Interrupts() {
-        meta, _ := ai.InterruptAs[TransferInterrupt](interrupt)
+// Interrupts() yields nothing unless the tool paused for input.
+var restarts []*ai.Part
+for _, interrupt := range resp.Interrupts() {
+    meta, _ := ai.InterruptAs[TransferInterrupt](interrupt)
 
-        // Get user confirmation, then resume
-        part, _ := transferTool.RestartWith(interrupt)
-        resp, _ = genkit.Generate(ctx, g,
-            ai.WithMessages(resp.History()...),
-            ai.WithTools(transferTool),
-            ai.WithToolRestarts(part),
-        )
-    }
+    // Use meta to get user confirmation, then resume with their answer.
+    part, _ := transferTool.RestartWith(interrupt)
+    restarts = append(restarts, part)
+}
+
+// Collect every restart first, then resume once: generating inside the loop
+// would resume later interrupts against a history that already moved on.
+if len(restarts) > 0 {
+    resp, _ = genkit.Generate(ctx, g,
+        ai.WithMessages(resp.History()...),
+        ai.WithTools(transferTool),
+        ai.WithToolRestarts(restarts...),
+    )
 }
 ```
 

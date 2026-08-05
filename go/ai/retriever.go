@@ -24,6 +24,7 @@ import (
 	"github.com/firebase/genkit/go/core"
 	"github.com/firebase/genkit/go/core/api"
 	"github.com/firebase/genkit/go/core/status"
+	"github.com/firebase/genkit/go/internal/base"
 )
 
 // RetrieverFunc is the function type for retriever implementations.
@@ -159,11 +160,12 @@ func (r *retriever) Retrieve(ctx context.Context, req *RetrieverRequest) (*Retri
 func Retrieve(ctx context.Context, r api.Registry, opts ...RetrieverOption) (*RetrieverResponse, error) {
 	retOpts := &retrieverOptions{}
 	for _, opt := range opts {
-		if err := opt.applyRetriever(retOpts); err != nil {
-			return nil, fmt.Errorf("ai.Retrieve: error applying options: %w", err)
-		}
+		opt.applyRetriever(retOpts)
 	}
 
+	if len(retOpts.Documents) == 0 {
+		return nil, errors.New("ai.Retrieve: a query document is required (WithDocs or WithTextDocs)")
+	}
 	if len(retOpts.Documents) > 1 {
 		return nil, errors.New("ai.Retrieve: only supports a single document as input")
 	}
@@ -181,7 +183,9 @@ func Retrieve(ctx context.Context, r api.Registry, opts ...RetrieverOption) (*Re
 	}
 
 	if retRef, ok := retOpts.Retriever.(RetrieverRef); ok && retOpts.Config == nil {
-		retOpts.Config = retRef.Config()
+		if cfg := retRef.Config(); !base.IsNil(cfg) {
+			retOpts.Config = cfg
+		}
 	}
 
 	req := &RetrieverRequest{

@@ -2344,6 +2344,108 @@ func TestGenerateData(t *testing.T) {
 	})
 }
 
+// TestGenerateDataCallerSchemaOverride verifies that GenerateData injects the
+// output type inferred from Out but still lets a caller-supplied
+// WithOutputSchema win the schema slot, while typed extraction keeps working.
+func TestGenerateDataCallerSchemaOverride(t *testing.T) {
+	r := newTestRegistry(t)
+
+	type TestOutput struct {
+		Value int `json:"value"`
+	}
+
+	var capturedSchema map[string]any
+	model := defineFakeModel(t, r, fakeModelConfig{
+		name: "test/captureSchema",
+		handler: func(ctx context.Context, req *ModelRequest, cb ModelStreamCallback) (*ModelResponse, error) {
+			if req.Output != nil {
+				capturedSchema = req.Output.Schema
+			}
+			return &ModelResponse{
+				Request: req,
+				Message: NewModelTextMessage(`{"value": 42}`),
+			}, nil
+		},
+	})
+
+	// A distinctive schema the inferred one would never produce.
+	customSchema := map[string]any{
+		"type":  "object",
+		"title": "CallerProvided",
+		"properties": map[string]any{
+			"value": map[string]any{"type": "integer"},
+		},
+	}
+
+	output, _, err := GenerateData[TestOutput](context.Background(), r,
+		WithModel(model),
+		WithPrompt("get value"),
+		WithOutputSchema(customSchema),
+	)
+	if err != nil {
+		t.Fatalf("GenerateData error: %v", err)
+	}
+
+	// The caller's schema reaches the model, overriding the type-inferred one.
+	if capturedSchema["title"] != "CallerProvided" {
+		t.Errorf("request output schema = %v, want caller-provided schema (title CallerProvided)", capturedSchema)
+	}
+	// Typed extraction from Out still works.
+	if output.Value != 42 {
+		t.Errorf("output.Value = %d, want 42", output.Value)
+	}
+}
+
+// TestGenerateStreamChainsUserCallback verifies that the stream-returning
+// wrappers chain a caller-supplied WithStreaming callback with their internal
+// iterator callback instead of displacing it: both must see every chunk.
+func TestGenerateStreamChainsUserCallback(t *testing.T) {
+	r := newTestRegistry(t)
+
+	model := defineFakeModel(t, r, fakeModelConfig{
+		name: "test/chunkedModel",
+		handler: func(ctx context.Context, req *ModelRequest, cb ModelStreamCallback) (*ModelResponse, error) {
+			if cb != nil {
+				if err := cb(ctx, &ModelResponseChunk{Content: []*Part{NewTextPart("one")}}); err != nil {
+					return nil, err
+				}
+				if err := cb(ctx, &ModelResponseChunk{Content: []*Part{NewTextPart("two")}}); err != nil {
+					return nil, err
+				}
+			}
+			return &ModelResponse{
+				Request: req,
+				Message: NewModelTextMessage("onetwo"),
+			}, nil
+		},
+	})
+
+	var userChunks []string
+	userCB := func(ctx context.Context, chunk *ModelResponseChunk) error {
+		userChunks = append(userChunks, chunk.Text())
+		return nil
+	}
+
+	var iterChunks []string
+	for v, err := range GenerateStream(context.Background(), r,
+		WithModel(model),
+		WithPrompt("count"),
+		WithStreaming(userCB),
+	) {
+		if err != nil {
+			t.Fatalf("GenerateStream error: %v", err)
+		}
+		if v.Done {
+			break
+		}
+		iterChunks = append(iterChunks, v.Chunk.Text())
+	}
+
+	want := []string{"one", "two"}
+	assertEqual(t, userChunks, want)
+	assertEqual(t, iterChunks, want)
+}
+
 func TestModelResponseReasoning(t *testing.T) {
 	t.Run("returns reasoning from response", func(t *testing.T) {
 		resp := &ModelResponse{
