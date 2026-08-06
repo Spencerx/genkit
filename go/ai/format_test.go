@@ -822,6 +822,7 @@ func (bananaHandler) Config() ModelOutputConfig {
 }
 
 func TestDefineFormatsCustom(t *testing.T) {
+	r := childRegistry(t)
 	DefineFormats(r, bananaFormatter{})
 
 	t.Run("resolves a custom format by its name", func(t *testing.T) {
@@ -1058,6 +1059,8 @@ func TestStreamingFormatHandlerInterface(t *testing.T) {
 }
 
 func TestConstrainedGenerateWithFormats(t *testing.T) {
+	r := childRegistry(t)
+
 	type FooBar struct {
 		Foo string `json:"foo"`
 	}

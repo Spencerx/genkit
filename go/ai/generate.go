@@ -551,6 +551,14 @@ func buildModelChain(mws []*Hooks, fn ModelFunc) ModelFunc {
 	return chain
 }
 
+// toolRanKey carries a per-call flag that the innermost runner sets when it
+// actually executes the tool, letting the engine attribute a hook that
+// short-circuits the call to the tool in traces. It rides the context rather
+// than ToolParams so that a WrapTool hook which rebuilds the params struct (to
+// rewrite the request, say) cannot silently lose it: every hook that derives
+// its context from the one it was handed keeps the flag.
+var toolRanKey = base.NewContextKey[*bool]()
+
 // buildToolRunner composes the WrapTool hooks from mws (outer-to-inner) into
 // a single function that executes a tool. The returned function is safe to
 // invoke from concurrent goroutines; each invocation threads its own params
@@ -570,6 +578,9 @@ func buildToolRunner(mws []*Hooks) func(ctx context.Context, tool Tool, req *Too
 		}
 	}
 	chain := func(ctx context.Context, params *ToolParams) (*MultipartToolResponse, error) {
+		if ran := toolRanKey.FromContext(ctx); ran != nil {
+			*ran = true
+		}
 		return params.Tool.RunRawMultipart(ctx, params.Request.Input)
 	}
 	for i := len(mws) - 1; i >= 0; i-- {
@@ -584,8 +595,34 @@ func buildToolRunner(mws []*Hooks) func(ctx context.Context, tool Tool, req *Too
 		}
 	}
 	return func(ctx context.Context, tool Tool, req *ToolRequest) (*MultipartToolResponse, error) {
-		return chain(ctx, &ToolParams{Request: req, Tool: tool})
+		ran := false
+		resp, err := chain(toolRanKey.NewContext(ctx, &ran), &ToolParams{Request: req, Tool: tool})
+		if !ran {
+			return recordToolShortCircuit(ctx, tool.Name(), req.Input, resp, err)
+		}
+		return resp, err
 	}
+}
+
+// recordToolShortCircuit emits the tool-shaped span that core/action.go would
+// have created, attributing a WrapTool outcome (interrupt, cached response,
+// injected error) to the tool in traces even though the tool never ran. The
+// span wraps the already-known outcome and returns it unchanged, so it records
+// what the tool call resolved to rather than how long the hooks took to
+// resolve it.
+func recordToolShortCircuit(ctx context.Context, name string, input any, resp *MultipartToolResponse, err error) (*MultipartToolResponse, error) {
+	spanMeta := &tracing.SpanMetadata{
+		Name:            name,
+		Type:            "action",
+		Subtype:         "tool",
+		Metadata:        map[string]string{},
+		TelemetryLabels: tracing.TelemetryLabelsFromContext(ctx),
+	}
+	if flowName := core.FlowNameFromContext(ctx); flowName != "" {
+		spanMeta.Metadata["flow:name"] = flowName
+	}
+	return tracing.RunInNewSpan(ctx, spanMeta, input,
+		func(context.Context, any) (*MultipartToolResponse, error) { return resp, err })
 }
 
 // Generate generates a model response based on the provided options.
