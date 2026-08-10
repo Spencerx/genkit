@@ -420,12 +420,21 @@ type inputOptions struct {
 	DefaultInput map[string]any // Default input that will be used if no input is provided.
 }
 
-// InputOption is an option for the input of a prompt or tool.
-// It applies only to DefinePrompt() and DefineTool().
+// InputOption is an option for the input of a prompt.
+// It applies only to DefinePrompt().
 type InputOption interface {
 	PromptOption
-	ToolOption
 	applyInput(*inputOptions)
+}
+
+// InputSchemaOption is an [InputOption] that provides an explicit input
+// schema, inline or by name. Unlike the schema-inference options, it also
+// applies to the tool constructors, where an explicit schema stands in for an
+// In type parameter of 'any'; a tool whose input shape a Go type can express
+// should use the type parameter instead.
+type InputSchemaOption interface {
+	InputOption
+	ToolOption
 }
 
 // applyInput applies the option to the input options. The input configuration
@@ -460,14 +469,15 @@ func WithInputType(input any) InputOption {
 	}
 }
 
-// WithInputSchema manually provides a schema map for the prompt's input.
-func WithInputSchema(schema map[string]any) InputOption {
+// WithInputSchema manually provides a schema map for the input.
+func WithInputSchema(schema map[string]any) InputSchemaOption {
 	return &inputOptions{InputSchema: schema}
 }
 
 // WithInputSchemaName sets a pre-registered schema by name for the input.
-// The schema will be resolved lazily at execution time using [DefineSchema].
-func WithInputSchemaName(name string) InputOption {
+// The schema is resolved from the registry at execution time; register it with
+// [github.com/firebase/genkit/go/genkit.DefineSchema].
+func WithInputSchemaName(name string) InputSchemaOption {
 	return &inputOptions{InputSchema: core.SchemaRef(name)}
 }
 
@@ -698,6 +708,18 @@ type OutputOption interface {
 	applyOutput(*outputOptions)
 }
 
+// OutputSchemaOption is an [OutputOption] that provides an explicit output
+// schema, inline or by name. Unlike the schema-inference and
+// generation-steering options, it also applies to the tool constructors: a
+// tool's output shape is decided by its function, so the only output options
+// that make sense there are explicit schemas standing in for an Out type
+// parameter of 'any'; a tool whose output a Go type can express should use
+// the type parameter instead.
+type OutputSchemaOption interface {
+	OutputOption
+	ToolOption
+}
+
 // applyOutput applies the option to the output options. The schema, format,
 // and instructions are independent single-value slots, so the last option to
 // set each one wins. This is what lets a caller-supplied [WithOutputSchema]
@@ -720,6 +742,16 @@ func (o *outputOptions) applyOutput(opts *outputOptions) {
 func (o *outputOptions) applyPrompt(opts *promptOptions)     { o.applyOutput(&opts.outputOptions) }
 func (o *outputOptions) applyGenerate(opts *generateOptions) { o.applyOutput(&opts.outputOptions) }
 
+// applyTool applies the option to the tool options. Only the explicit-schema
+// output options reach here: [OutputSchemaOption] is the sole output option
+// type that satisfies [ToolOption]. The schema is a single-value slot, so the
+// last option to set it wins.
+func (o *outputOptions) applyTool(tOpts *toolOptions) {
+	if o.OutputSchema != nil {
+		tOpts.OutputSchema = o.OutputSchema
+	}
+}
+
 // WithOutputType sets the output format to JSON and the schema derived from the given value.
 func WithOutputType(output any) OutputOption {
 	return &outputOptions{
@@ -728,9 +760,8 @@ func WithOutputType(output any) OutputOption {
 	}
 }
 
-// WithOutputSchema manually provides a schema map for the prompt's output.
-// The outputted value will serve as the default output if no output is given at generation time.
-func WithOutputSchema(schema map[string]any) OutputOption {
+// WithOutputSchema manually provides a schema map for the output.
+func WithOutputSchema(schema map[string]any) OutputSchemaOption {
 	return &outputOptions{
 		OutputSchema: schema,
 		OutputFormat: OutputFormatJSON,
@@ -738,7 +769,8 @@ func WithOutputSchema(schema map[string]any) OutputOption {
 }
 
 // WithOutputSchemaName sets the schema name that will be resolved at execution time.
-func WithOutputSchemaName(name string) OutputOption {
+// Register the schema with [github.com/firebase/genkit/go/genkit.DefineSchema].
+func WithOutputSchemaName(name string) OutputSchemaOption {
 	return &outputOptions{
 		OutputSchema: core.SchemaRef(name),
 		OutputFormat: OutputFormatJSON,
@@ -1086,6 +1118,7 @@ func WithToolRestarts(parts ...*Part) GenerateOption {
 // toolOptions holds configuration options for defining tools.
 type toolOptions struct {
 	inputOptions
+	OutputSchema map[string]any // JSON schema of the tool's output.
 	StrictSchema *bool
 }
 
@@ -1095,6 +1128,9 @@ type ToolOption interface {
 }
 
 func (o *toolOptions) applyTool(opts *toolOptions) {
+	if o.OutputSchema != nil {
+		opts.OutputSchema = o.OutputSchema
+	}
 	if o.StrictSchema != nil {
 		opts.StrictSchema = o.StrictSchema
 	}

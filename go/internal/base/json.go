@@ -352,7 +352,21 @@ func StructToMap[T any](v T) (map[string]any, error) {
 	return m, nil
 }
 
-// SchemaAsMap converts json schema struct to a map (JSON representation).
+// SchemaMapFor returns the JSON schema inferred from type T as a map, or nil
+// for interface types (e.g. `any`), whose zero value carries no type
+// information to infer from. Like [SchemaAsMap], the returned map is freshly
+// built on every call and belongs to the caller.
+func SchemaMapFor[T any]() map[string]any {
+	var v T
+	if reflect.ValueOf(v).Kind() == reflect.Invalid {
+		return nil
+	}
+	return SchemaAsMap(InferJSONSchema(v))
+}
+
+// SchemaAsMap converts json schema struct to a map (JSON representation). The
+// map is rebuilt from JSON on every call, so the caller owns it and may mutate
+// it in place; memoizing the result here would break callers that do.
 func SchemaAsMap(s *jsonschema.Schema) map[string]any {
 	jsb, err := s.MarshalJSON()
 	if err != nil {
