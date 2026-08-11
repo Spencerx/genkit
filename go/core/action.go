@@ -265,7 +265,7 @@ func (a *Action[In, Out, Stream]) runWithTelemetry(ctx context.Context, input In
 			var inputSchema map[string]any
 			inputSchema, err = ResolveSchema(a.registry, a.desc.InputSchema)
 			if err != nil {
-				return base.Zero[Out](), status.Errorf(status.ErrInvalidSchema, "invalid input schema for action %q: %v", a.desc.Key, err)
+				return base.Zero[Out](), status.Errorf(status.ErrInvalidSchema, "invalid input schema for action %q: %w", a.desc.Key, err)
 			}
 
 			var outputSchema map[string]any
@@ -275,7 +275,7 @@ func (a *Action[In, Out, Stream]) runWithTelemetry(ctx context.Context, input In
 			}
 
 			if err = base.ValidateValue(input, inputSchema); err != nil {
-				return base.Zero[Out](), NewSchemaValidationError(a.desc.Key, err)
+				return base.Zero[Out](), status.Errorf(status.ErrInvalidInput, "invalid input to action %q: %w", a.desc.Key, err)
 			}
 
 			output, err = fn(ctx, input, cb)
@@ -327,7 +327,7 @@ func recordActionMetrics(ctx context.Context, name string, start time.Time, err 
 func (a *Action[In, Out, Stream]) resolveOutputSchema() (map[string]any, error) {
 	schema, err := ResolveSchema(a.registry, a.desc.OutputSchema)
 	if err != nil {
-		return nil, status.Errorf(status.ErrInvalidSchema, "invalid output schema for action %q: %v", a.desc.Key, err)
+		return nil, status.Errorf(status.ErrInvalidSchema, "invalid output schema for action %q: %w", a.desc.Key, err)
 	}
 	return schema, nil
 }
@@ -336,7 +336,7 @@ func (a *Action[In, Out, Stream]) resolveOutputSchema() (map[string]any, error) 
 // schema.
 func (a *Action[In, Out, Stream]) validateOutput(out Out, schema map[string]any) error {
 	if err := base.ValidateValue(out, schema); err != nil {
-		return status.Errorf(status.ErrInvalidOutput, "invalid output from action %q: %v", a.desc.Key, err)
+		return status.Errorf(status.ErrInvalidOutput, "invalid output from action %q: %w", a.desc.Key, err)
 	}
 	return nil
 }
@@ -360,7 +360,7 @@ func (a *Action[In, Out, Stream]) RunJSONWithTelemetry(ctx context.Context, inpu
 func (a *Action[In, Out, Stream]) runJSONWithTelemetry(ctx context.Context, input json.RawMessage, cb StreamCallback[json.RawMessage], fn StreamingFunc[In, Out, Stream], spanInit any) (*api.ActionRunResult[json.RawMessage], error) {
 	i, err := base.UnmarshalAndNormalize[In](input, a.desc.InputSchema)
 	if err != nil {
-		return nil, NewSchemaValidationError(a.desc.Key, err)
+		return nil, status.Errorf(status.ErrInvalidInput, "invalid input to action %q: %w", a.desc.Key, err)
 	}
 
 	var scb StreamCallback[Stream]
