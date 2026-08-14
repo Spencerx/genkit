@@ -16,6 +16,7 @@ package compat_oai_test
 
 import (
 	"context"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -24,6 +25,7 @@ import (
 	"github.com/firebase/genkit/go/genkit"
 	"github.com/firebase/genkit/go/plugins/compat_oai/anthropic"
 	"github.com/firebase/genkit/go/plugins/compat_oai/dashscope"
+	"github.com/firebase/genkit/go/plugins/compat_oai/kimi"
 )
 
 // canonicalTypes is the JSON type each shared config field must have wherever
@@ -52,15 +54,18 @@ var canonicalTypes = map[string]string{
 func TestConfigSchemaConformance(t *testing.T) {
 	t.Setenv("ANTHROPIC_API_KEY", "test-key")
 	t.Setenv("DASHSCOPE_API_KEY", "test-key")
+	t.Setenv("KIMI_API_KEY", "test-key")
 
 	g := genkit.Init(context.Background(), genkit.WithPlugins(
 		&anthropic.Anthropic{},
 		&dashscope.DashScope{},
+		&kimi.Kimi{},
 	))
 
 	models := []string{
 		"anthropic/claude-sonnet-4-5-20250929",
 		"dashscope/qwen-plus",
+		"kimi/kimi-k3",
 	}
 
 	for _, name := range models {
@@ -141,6 +146,7 @@ func requireDescriptions(t *testing.T, path string, props map[string]any) {
 func TestModelsOverrideConformance(t *testing.T) {
 	t.Setenv("ANTHROPIC_API_KEY", "test-key")
 	t.Setenv("DASHSCOPE_API_KEY", "test-key")
+	t.Setenv("KIMI_API_KEY", "test-key")
 
 	// Keyed provider-prefixed on half of them, bare on the rest: both forms
 	// name the same model.
@@ -150,11 +156,13 @@ func TestModelsOverrideConformance(t *testing.T) {
 		&anthropic.Anthropic{Models: map[string]ai.ModelOptions{
 			"anthropic/claude-sonnet-4-5-20250929": pinned}},
 		&dashscope.DashScope{Models: map[string]ai.ModelOptions{"qwen-plus": pinned}},
+		&kimi.Kimi{Models: map[string]ai.ModelOptions{"kimi-k3": pinned}},
 	))
 
 	for _, name := range []string{
 		"anthropic/claude-sonnet-4-5-20250929",
 		"dashscope/qwen-plus",
+		"kimi/kimi-k3",
 	} {
 		t.Run(name, func(t *testing.T) {
 			m := genkit.LookupModel(g, name)
@@ -178,5 +186,49 @@ func TestModelsOverrideConformance(t *testing.T) {
 				t.Error("label is empty, want the curated one kept by the overlay")
 			}
 		})
+	}
+}
+
+// TestClosedEnumsUseNamedTypes pins the family rule for closed sets: a config
+// field whose schema declares an enum is typed as a named string type of its
+// package, so the allowed values are discoverable as constants in code rather
+// than only in the schema. Open sets carry no enum and stay bare strings,
+// since constants would imply a closure the provider's docs refuse to give.
+// Each new plugin adds its config here.
+func TestClosedEnumsUseNamedTypes(t *testing.T) {
+	configs := map[string]any{
+		"anthropic": anthropic.ChatConfig{},
+		"dashscope": dashscope.ChatConfig{},
+		"kimi":      kimi.ChatConfig{},
+	}
+	for name, config := range configs {
+		t.Run(name, func(t *testing.T) {
+			checkClosedEnums(t, "", reflect.TypeOf(config))
+		})
+	}
+}
+
+// checkClosedEnums walks a config struct's fields, recursing through structs
+// and pointers to structs, and fails for any enum-tagged field typed as a
+// bare string.
+func checkClosedEnums(t *testing.T, path string, typ reflect.Type) {
+	t.Helper()
+	for i := range typ.NumField() {
+		field := typ.Field(i)
+		name := path + field.Name
+		ft := field.Type
+		for ft.Kind() == reflect.Pointer {
+			ft = ft.Elem()
+		}
+		if ft.Kind() == reflect.Struct {
+			checkClosedEnums(t, name+".", ft)
+			continue
+		}
+		if !strings.Contains(field.Tag.Get("jsonschema"), "enum=") {
+			continue
+		}
+		if ft.Kind() == reflect.String && ft.PkgPath() == "" {
+			t.Errorf("%s declares a schema enum on a bare string, want a named string type with exported constants", name)
+		}
 	}
 }
