@@ -20,11 +20,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/firebase/genkit/go/ai"
 	aix "github.com/firebase/genkit/go/ai/exp"
+	"github.com/firebase/genkit/go/core/status"
 	"github.com/firebase/genkit/go/genkit"
 	genkitx "github.com/firebase/genkit/go/genkit/exp"
 )
@@ -86,46 +88,102 @@ func delegateOnceModel(t *testing.T, g *genkit.Genkit, name, toolName, task stri
 	})
 }
 
-// decodeDelegation re-decodes a tool response output into a delegationResult,
-// tolerating either the raw struct or a JSON-normalized map.
-func decodeDelegation(t *testing.T, v any) delegationResult {
-	t.Helper()
-	b, err := json.Marshal(v)
-	if err != nil {
-		t.Fatalf("marshal tool output: %v", err)
-	}
-	var dr delegationResult
-	if err := json.Unmarshal(b, &dr); err != nil {
-		t.Fatalf("unmarshal delegationResult: %v", err)
-	}
-	return dr
-}
-
-// delegationResponses collects every delegation tool response for toolName.
-func delegationResponses(t *testing.T, msgs []*ai.Message, toolName string) []delegationResult {
-	t.Helper()
-	var out []delegationResult
+// toolOutputs collects the raw outputs of every tool response for toolName.
+func toolOutputs(msgs []*ai.Message, toolName string) []any {
+	var out []any
 	for _, m := range msgs {
 		for _, p := range m.Content {
 			if p.IsToolResponse() && p.ToolResponse != nil && p.ToolResponse.Name == toolName {
-				out = append(out, decodeDelegation(t, p.ToolResponse.Output))
+				out = append(out, p.ToolResponse.Output)
 			}
 		}
 	}
 	return out
 }
 
-func TestAgentsValidation(t *testing.T) {
-	if _, err := (&Agents{}).New(ctx); err == nil {
-		t.Error("expected error when no agents are configured")
+// decodeToolOutput re-decodes a tool response output into T, tolerating either
+// the raw struct or a JSON-normalized map.
+func decodeToolOutput[T any](t *testing.T, v any) T {
+	t.Helper()
+	var decoded T
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("marshal tool output: %v", err)
 	}
-	if _, err := (&Agents{Agents: []aix.AgentRef{{Name: ""}}}).New(ctx); err == nil {
-		t.Error("expected error when an agent reference has no name")
+	if err := json.Unmarshal(b, &decoded); err != nil {
+		t.Fatalf("unmarshal %T: %v", decoded, err)
+	}
+	return decoded
+}
+
+// delegationResponses collects every delegation tool response for toolName.
+func delegationResponses(t *testing.T, msgs []*ai.Message, toolName string) []delegationResult {
+	t.Helper()
+	var out []delegationResult
+	for _, v := range toolOutputs(msgs, toolName) {
+		out = append(out, decodeToolOutput[delegationResult](t, v))
+	}
+	return out
+}
+
+func TestAgentsValidation(t *testing.T) {
+	if _, err := (&Agents{}).New(ctx); !errors.Is(err, status.ErrInvalidArgument) {
+		t.Errorf("expected an INVALID_ARGUMENT error when no agents are configured, got %v", err)
+	}
+	if _, err := (&Agents{Agents: []aix.AgentRef{{Name: ""}}}).New(ctx); !errors.Is(err, status.ErrInvalidArgument) {
+		t.Errorf("expected an INVALID_ARGUMENT error when an agent reference has no name, got %v", err)
 	}
 	if _, err := (&Agents{Agents: []aix.AgentRef{{Name: "ok"}}}).New(ctx); err != nil {
 		t.Errorf("unexpected error for a valid config: %v", err)
 	}
+
+	// Generated tool names are validated as a set at New time, so collisions
+	// surface as a config error instead of a generate-time duplicate-tool
+	// rejection of the whole request.
+	if _, err := (&Agents{Agents: []aix.AgentRef{{Name: "dup"}, {Name: "dup"}}}).New(ctx); !errors.Is(err, status.ErrInvalidArgument) {
+		t.Errorf("expected an INVALID_ARGUMENT error for duplicate agent names, got %v", err)
+	}
+	// With a bare prefix, a delegation tool can land exactly on a shared
+	// background-task tool's name.
+	bare := ""
+	collide := &Agents{
+		Agents:     []aix.AgentRef{{Name: "check_background_tasks"}},
+		ToolPrefix: &bare,
+		Async:      true,
+	}
+	if _, err := collide.New(ctx); !errors.Is(err, status.ErrInvalidArgument) {
+		t.Errorf("expected an INVALID_ARGUMENT error when a delegation tool collides with a background-task tool, got %v", err)
+	}
 }
+
+func TestAgentsBackgroundToolNames(t *testing.T) {
+	// Default and empty prefixes keep the well-known bare names; an explicit
+	// non-empty prefix namespaces all three so two Async instances can coexist.
+	bare := []string{"check_background_tasks", "wait_for_background_tasks", "abort_background_tasks"}
+	cases := []struct {
+		name   string
+		prefix *string
+		want   []string
+	}{
+		{name: "nil prefix", prefix: nil, want: bare},
+		{name: "empty prefix", prefix: ptr(""), want: bare},
+		{name: "custom prefix", prefix: ptr("research"), want: []string{
+			"research_check_background_tasks",
+			"research_wait_for_background_tasks",
+			"research_abort_background_tasks",
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := &Agents{ToolPrefix: tc.prefix}
+			if got := a.backgroundToolNames().all(); !slices.Equal(got, tc.want) {
+				t.Errorf("backgroundToolNames().all() = %q; want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func ptr[T any](v T) *T { return &v }
 
 func TestAgentsInjectsSystemPrompt(t *testing.T) {
 	g := newTestGenkit(t)
@@ -204,9 +262,14 @@ func TestAgentsUnknownAgentReportsError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The refusal names the agent and says it is not registered, which is the
+	// deployment mistake it actually is: the name was configured on this
+	// middleware, so an empty lookup means nothing defined it in this process.
 	got := delegationResponses(t, resp.History(), "delegate_to_ghost")
-	if len(got) != 1 || !strings.Contains(got[0].Response, "not found") {
-		t.Fatalf("expected a 'not found' delegation response, got %+v", got)
+	if len(got) != 1 ||
+		!strings.Contains(got[0].Response, `"ghost"`) ||
+		!strings.Contains(got[0].Response, "not registered") {
+		t.Fatalf("expected a refusal naming the unregistered agent, got %+v", got)
 	}
 }
 
@@ -526,6 +589,7 @@ func TestAgentsConfigSerialization(t *testing.T) {
 		MaxDelegations:   3,
 		HistoryLength:    2,
 		ArtifactStrategy: ArtifactStrategySession,
+		Async:            true,
 	}
 	b, err := json.Marshal(cfg)
 	if err != nil {
@@ -543,6 +607,9 @@ func TestAgentsConfigSerialization(t *testing.T) {
 	}
 	if got.ArtifactStrategy != ArtifactStrategySession {
 		t.Errorf("artifactStrategy lost in round trip: %q", got.ArtifactStrategy)
+	}
+	if !got.Async {
+		t.Error("async lost in round trip")
 	}
 }
 

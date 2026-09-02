@@ -446,7 +446,7 @@ Detach requires a store that implements `SnapshotSubscriber` (both bundled local
 > [!WARNING]
 > This API is in preview and may experience breaking changes in minor releases.
 
-The experimental `Agents` middleware (in `plugins/middleware/exp`) lets one agent delegate to others. It injects one `delegate_to_<name>` tool per sub-agent and a `<sub-agents>` listing into the orchestrator's system prompt, then runs the chosen sub-agent and returns its result when the model calls the tool. Each sub-agent's `aix.WithDescription` (captured by `agent.Ref()`) tells the orchestrator when to reach for it:
+The experimental `Agents` middleware (in `plugins/middleware/exp`) lets one agent delegate to others. It injects one `delegate_to_<name>` tool per sub-agent and a `<sub-agents>` listing into the orchestrator's system prompt, then runs the chosen sub-agent and returns its result when the model calls the tool. Each sub-agent's `aix.WithDescription` (captured by `agent.Ref()`) tells the orchestrator when to reach for it.
 
 ```go
 import (
@@ -484,6 +484,27 @@ orchestrator := genkitx.DefineAgent(g, "orchestrator",
 out, _ := orchestrator.RunText(ctx, "Research goroutine scheduling and summarize the key ideas.")
 fmt.Println(out.Message.Text())
 ```
+
+Set `Async: true` to let the orchestrator keep working while a sub-agent runs. Each delegation tool gains a `background` flag that returns a task ID instead of waiting, and three shared tools give the orchestrator one control per thing it can do with a launched task: `check_background_tasks` reads statuses without waiting, `wait_for_background_tasks` blocks until they settle, and `abort_background_tasks` stops the ones whose results are no longer needed. The *sub-agent* is what needs the session store here: background work is tracked by a snapshot, so a sub-agent without one can only be delegated to synchronously (see `AgentMetadata.Abortable`).
+
+```go
+// The sub-agent needs its own store to be delegated to in the background.
+researcher := genkitx.DefineAgent(g, "researcher",
+    aix.InlinePrompt{
+        ai.WithModelName("googleai/gemini-flash-latest"),
+        ai.WithSystem("You are a thorough research assistant."),
+    },
+    aix.WithDescription[any]("Researches a topic and summarizes well-sourced findings."),
+    aix.WithSessionStore(localstore.NewInMemorySessionStore[any]()),
+)
+
+ai.WithUse(&middlewarex.Agents{
+    Agents: []aix.AgentRef{researcher.Ref()},
+    Async:  true,
+})
+```
+
+The orchestrator then launches with `{"task": "...", "background": true}`, posts an update while the sub-agent runs, and collects the result later. `wait_for_background_tasks` takes an optional `timeoutSeconds`, so a slow task becomes an interim answer instead of a blocked turn, and `waitFor: "first"` turns the join into a race: the tool returns as soon as any listed task settles while the rest keep running, so the orchestrator can act on the first answer. An abort is safe to call on any task: one that had already finished is left alone and reports its result, so the orchestrator never loses an answer by giving up on it.
 
 Sub-agents are named by `aix.AgentRef`, either captured from an agent value with `agent.Ref()` or written by hand (`aix.AgentRef{Name: "researcher"}`). The middleware composes with the `Artifacts` middleware: give a sub-agent `&middlewarex.Artifacts{}` so it can save output, set `ArtifactStrategy: middlewarex.ArtifactStrategySession` to merge those artifacts into the orchestrator's session instead of inlining them in the tool result, and add `&middlewarex.Artifacts{Readonly: true}` on the orchestrator so it can review them before answering.
 
