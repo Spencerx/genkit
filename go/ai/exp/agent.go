@@ -671,14 +671,16 @@ type AgentFunc[State any] = func(ctx context.Context, resp Responder, sess *Sess
 //
 // Server-managed agents (those with a [SessionStore] configured) also
 // register companion actions for the snapshot lifecycle, available via
-// [Agent.GetSnapshotAction] and [Agent.AbortAction] for serving
-// alongside the agent, and expose the store itself via [Agent.Store].
+// [Agent.GetSnapshotAction], [Agent.WaitForSnapshotAction], and
+// [Agent.AbortAction] for serving alongside the agent, and expose the store
+// itself via [Agent.Store].
 type Agent[State any] struct {
 	action *core.BidiAction[*AgentInput, *AgentOutput[State], *AgentStreamChunk, *AgentInit[State]]
 	// Companion actions, retained so transports can serve them without a
 	// registry lookup. Nil when the corresponding capability is absent;
 	// see newSnapshotActions.
 	getSnapshot api.Action
+	wait        api.Action
 	abort       api.Action
 	// store is the configured session store, or nil for a client-managed
 	// agent. Retained so callers can reach it via Store without threading
@@ -693,7 +695,7 @@ type Agent[State any] struct {
 
 // Name returns the agent's registered name. This is also the name under
 // which any inline-defined prompt and companion actions (getSnapshot,
-// abort) are registered.
+// waitForSnapshot, abort) are registered.
 func (a *Agent[State]) Name() string {
 	return a.action.Name()
 }
@@ -709,6 +711,19 @@ func (a *Agent[State]) Name() string {
 // [Agent.GetSnapshot], which applies the configured state transform.
 func (a *Agent[State]) GetSnapshotAction() api.Action {
 	return a.getSnapshot
+}
+
+// WaitForSnapshotAction returns the agent's waitForSnapshot companion action,
+// which resolves a snapshot the same way getSnapshot does and returns once it
+// settles (input [GetSnapshotRequest], output [SessionSnapshot]). It returns
+// nil when the agent is client-managed (no [SessionStore] configured).
+//
+// Use it to expose following a detached invocation over a transport (e.g.
+// mount it with genkit.Handler next to the agent itself), so a remote caller
+// waits in one request instead of a read per tick; local Go code should use
+// [Agent.WaitForSnapshot], which applies the configured state transform.
+func (a *Agent[State]) WaitForSnapshotAction() api.Action {
+	return a.wait
 }
 
 // AbortAction returns the agent's abort companion action,
@@ -756,7 +771,31 @@ func (a *Agent[State]) GetSnapshot(ctx context.Context, snapshotID string) (*Ses
 	if snapshotID == "" {
 		return nil, status.Errorf(status.ErrInvalidArgument, "agent %q: GetSnapshot: snapshotID is required", a.Name())
 	}
-	return readSnapshot(ctx, a.store, a.transform, snapshotID, "")
+	return readSnapshot(ctx, a.store, a.transform, "getSnapshot", snapshotID, "")
+}
+
+// WaitForSnapshot fetches a session snapshot by ID and blocks until it settles,
+// returning the terminal snapshot with the same transform and shaping as
+// [Agent.GetSnapshot]. An already-terminal snapshot returns at once. It is how
+// an owner follows a detached invocation to its end; a caller holding only the
+// agent's name waits through [AgentHandle.WaitForSnapshot] instead.
+//
+// A snapshot that failed, aborted, or expired is returned like any other, so a
+// non-nil error means the wait itself could not proceed: reads failed past the
+// wait's transient-retry budget, or ctx ended and its error is returned. Bound
+// the wait with [context.WithTimeout] and read the snapshot afterwards to
+// learn where it stands.
+//
+// It returns FAILED_PRECONDITION on a client-managed agent (no store) and
+// INVALID_ARGUMENT when snapshotID is empty; a missing snapshot is NOT_FOUND.
+func (a *Agent[State]) WaitForSnapshot(ctx context.Context, snapshotID string) (*SessionSnapshot[State], error) {
+	if a.store == nil {
+		return nil, status.Errorf(ErrSessionStoreNotConfigured, "agent %q: WaitForSnapshot requires a session store", a.Name())
+	}
+	if snapshotID == "" {
+		return nil, status.Errorf(status.ErrInvalidArgument, "agent %q: WaitForSnapshot: snapshotID is required", a.Name())
+	}
+	return waitSnapshot(ctx, a.store, a.transform, "waitForSnapshot", snapshotID, "")
 }
 
 // GetLatestSnapshot fetches a session's most recently created snapshot (whatever
@@ -773,7 +812,7 @@ func (a *Agent[State]) GetLatestSnapshot(ctx context.Context, sessionID string) 
 	if sessionID == "" {
 		return nil, status.Errorf(status.ErrInvalidArgument, "agent %q: GetLatestSnapshot: sessionID is required", a.Name())
 	}
-	return readSnapshot(ctx, a.store, a.transform, "", sessionID)
+	return readSnapshot(ctx, a.store, a.transform, "getSnapshot", "", sessionID)
 }
 
 // Abort aborts the detached invocation behind a pending snapshot by
@@ -806,7 +845,7 @@ func (a *Agent[State]) Abort(ctx context.Context, snapshotID string) (SnapshotSt
 var _ api.BidiAction = (*Agent[any])(nil)
 
 // Register registers the agent's run action and any companion actions
-// (getSnapshot, abort) with the registry. Agents defined via
+// (getSnapshot, waitForSnapshot, abort) with the registry. Agents defined via
 // [DefineAgent] or [DefineCustomAgent] are already registered; this
 // exists so an agent can travel to another registry as a unit. An
 // inline-defined prompt does not travel: the agent holds it directly, so
@@ -822,11 +861,10 @@ func (a *Agent[State]) Register(r api.Registry) {
 	// registry consumers recover them by key (genkit.LookupAction) rather
 	// than by reaching through the agent action; see newSnapshotActions.
 	a.action.Register(r)
-	if a.getSnapshot != nil {
-		a.getSnapshot.Register(r)
-	}
-	if a.abort != nil {
-		a.abort.Register(r)
+	for _, companion := range []api.Action{a.getSnapshot, a.wait, a.abort} {
+		if companion != nil {
+			companion.Register(r)
+		}
 	}
 }
 
@@ -1050,11 +1088,12 @@ func newCustomAgent[State any](
 			return rt.run(ctx, fn)
 		})
 
-	getSnapshot, abort := newSnapshotActions(name, cfg.store, cfg.transform)
+	getSnapshot, wait, abort := newSnapshotActions(name, cfg.store, cfg.transform)
 
 	return &Agent[State]{
 		action:      action,
 		getSnapshot: getSnapshot,
+		wait:        wait,
 		abort:       abort,
 		store:       cfg.store,
 		transform:   cfg.transform,
@@ -1754,8 +1793,14 @@ func (rt *agentRuntime[State]) handleDetach(
 	// an interval below). Timestamps are caller-managed; a reader treats a
 	// pending snapshot whose heartbeat has gone stale as expired (its background
 	// worker is presumed dead).
+	//
+	// The runtime mints the pending row's ID, as reserveTurnSnapshotID does for
+	// turn snapshots, rather than letting the store mint at write time: task
+	// handles built on this ID rely on the runtime's UUID format (in
+	// particular, it contains no ':'), which a store-minted ID would not
+	// guarantee.
 	now := time.Now()
-	pending, err := rt.cfg.store.SaveSnapshot(context.WithoutCancel(clientCtx), "",
+	pending, err := rt.cfg.store.SaveSnapshot(context.WithoutCancel(clientCtx), uuid.New().String(),
 		func(_ *SessionSnapshot[State]) (*SessionSnapshot[State], error) {
 			return &SessionSnapshot[State]{
 				SessionID:   sessionID,
@@ -3083,12 +3128,15 @@ func agentLoop[State any](r api.Registry, prompt ai.Prompt, defaultInput any) Ag
 
 // Connect starts a new agent invocation with bidirectional streaming.
 // Use this for multi-turn interactions where you need to send multiple inputs
-// and receive streaming chunks. For single-turn usage, see Run and RunText.
+// and receive streaming chunks. For single-turn usage, see Run and RunText;
+// for a single turn that keeps working after the call returns, RunDetached.
 func (a *Agent[State]) Connect(
 	ctx context.Context,
 	opts ...InvocationOption[State],
 ) (*AgentConnection[State], error) {
-	init, err := a.resolveOptions(opts)
+	// The merge rules live in resolveInvocationInit (option.go), shared with
+	// the untyped [AgentHandle] surface.
+	init, err := resolveInvocationInit(a.action.Name(), opts)
 	if err != nil {
 		return nil, err
 	}
@@ -3137,32 +3185,49 @@ func (a *Agent[State]) RunText(
 	}, opts...)
 }
 
-// resolveOptions applies invocation options and returns the init struct.
-// Mutual exclusivity is checked here, once, after all options are merged:
-// WithState excludes both WithSessionID and WithSnapshotID (a
-// client-managed conversation's identity rides inside the state itself),
-// while WithSessionID and WithSnapshotID compose as an assertion.
-// Per-option duplicate checks live in applyInvocation.
-func (a *Agent[State]) resolveOptions(opts []InvocationOption[State]) (*AgentInit[State], error) {
-	invOpts := &invocationOptions[State]{}
-	for _, opt := range opts {
-		if err := opt.applyInvocation(invOpts); err != nil {
-			return nil, fmt.Errorf("Agent %q: %w", a.action.Name(), err)
-		}
+// RunDetached launches input as a detached (background) invocation and returns
+// the task tracking it. It is the one-shot counterpart of
+// [AgentConnection.Detach]: the input is delivered with [AgentInput.Detach]
+// set, whatever the caller set it to; the runtime persists a pending snapshot
+// and keeps working on a context decoupled from ctx; and the returned
+// [DetachedTask] polls, waits on, or aborts that snapshot, with custom state
+// typed as State. The pending snapshot is the durable record: record
+// [DetachedTask.SnapshotID] and rehydrate with [Agent.Task] to pick the
+// work up later, including from another process.
+//
+// The launch is rejected with FAILED_PRECONDITION when the agent cannot
+// support detach: it has no session store, or the store does not implement
+// [SnapshotSubscriber]. The rejection is the invocation's failed output
+// ([AgentOutput.Error]) surfaced as the returned error; match it by status.
+//
+// An agent may also settle the invocation synchronously, before the runtime
+// observes the detach directive (e.g. a custom agent whose fn returns without
+// consuming the input). When a turn committed, RunDetached returns a task over
+// its snapshot, which is already terminal, so Poll and Wait resolve
+// immediately; when nothing was recorded, it fails with FAILED_PRECONDITION
+// naming the finish reason, since there is no durable record to track.
+func (a *Agent[State]) RunDetached(
+	ctx context.Context,
+	input *AgentInput,
+	opts ...InvocationOption[State],
+) (*DetachedTask[State], error) {
+	if input == nil {
+		return nil, status.Errorf(status.ErrInvalidArgument, "agent %q: input must not be nil", a.Name())
 	}
+	out, err := a.Run(ctx, detachedInput(input), opts...)
+	if err != nil {
+		return nil, err
+	}
+	return detachedTaskFrom(a.Name(), a, out)
+}
 
-	if invOpts.state != nil && invOpts.snapshotID != "" {
-		return nil, fmt.Errorf("Agent %q: WithState and WithSnapshotID are mutually exclusive", a.action.Name())
-	}
-	if invOpts.state != nil && invOpts.sessionIDSet {
-		return nil, fmt.Errorf("Agent %q: WithState and WithSessionID are mutually exclusive; the conversation's identity rides inside the state (SessionState.SessionID)", a.action.Name())
-	}
-
-	return &AgentInit[State]{
-		SessionID:  invOpts.sessionID,
-		SnapshotID: invOpts.snapshotID,
-		State:      invOpts.state,
-	}, nil
+// Task returns the task tracking a snapshot ID recorded earlier (e.g.
+// by a prior process that called [Agent.RunDetached]), with custom state typed
+// as State. It performs no I/O and does not verify the snapshot exists; the
+// first [DetachedTask.Poll] or [DetachedTask.Wait] surfaces NOT_FOUND for an
+// unknown ID.
+func (a *Agent[State]) Task(snapshotID string) *DetachedTask[State] {
+	return &DetachedTask[State]{ops: a, snapshotID: snapshotID}
 }
 
 // --- AgentConnection ---

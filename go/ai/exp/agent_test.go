@@ -2416,6 +2416,74 @@ func TestAgent_RunText_WithSnapshot(t *testing.T) {
 	}
 }
 
+func TestAgent_RunDetached(t *testing.T) {
+	// The typed launch: the task polls, rehydrates, and waits with custom
+	// state typed as the agent's own, so the owner never unmarshals raw JSON.
+	reg := newTestRegistry(t)
+	store := newTestInMemStore[testState]()
+	agent, entered, release := defineGatedAgent(t, reg, "typedWorker", store)
+
+	task, err := agent.RunDetached(context.Background(), &AgentInput{Message: ai.NewUserTextMessage("go")})
+	if err != nil {
+		t.Fatalf("RunDetached: %v", err)
+	}
+	if task.SnapshotID() == "" {
+		t.Fatal("RunDetached returned a task with no snapshot ID")
+	}
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("background work did not start")
+	}
+
+	snap, err := task.Poll(context.Background())
+	if err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+	if snap.Status != SnapshotStatusPending {
+		t.Fatalf("Poll status = %q, want %q", snap.Status, SnapshotStatusPending)
+	}
+
+	close(release)
+	final, err := agent.Task(task.SnapshotID()).Wait(context.Background())
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if final.Status != SnapshotStatusCompleted {
+		t.Fatalf("Wait status = %q, want %q", final.Status, SnapshotStatusCompleted)
+	}
+	if final.State == nil || final.State.Custom.Counter != 42 {
+		t.Fatalf("final state = %+v, want typed custom state with Counter 42", final.State)
+	}
+
+	// Aborting a settled task reports its terminal status, as Agent.Abort does.
+	if got, err := task.Abort(context.Background()); err != nil || got != SnapshotStatusCompleted {
+		t.Fatalf("Abort after settle = (%q, %v), want (%q, nil)", got, err, SnapshotStatusCompleted)
+	}
+}
+
+func TestAgent_RunDetached_Rejected(t *testing.T) {
+	t.Run("nil input", func(t *testing.T) {
+		reg := newTestRegistry(t)
+		agent, _, _ := defineGatedAgent(t, reg, "nilInput", newTestInMemStore[testState]())
+		if _, err := agent.RunDetached(context.Background(), nil); !errors.Is(err, status.ErrInvalidArgument) {
+			t.Fatalf("RunDetached(nil) error = %v, want INVALID_ARGUMENT", err)
+		}
+	})
+
+	t.Run("client-managed agent cannot detach", func(t *testing.T) {
+		reg := newTestRegistry(t)
+		agent := defineEchoAgent(t, reg, "storeless")
+		_, err := agent.RunDetached(context.Background(), &AgentInput{Message: ai.NewUserTextMessage("go")})
+		if err == nil {
+			t.Fatal("RunDetached succeeded on a storeless agent, want rejection")
+		}
+		if got := status.Of(err); got != status.FailedPrecondition {
+			t.Fatalf("status.Of(err) = %v, want FAILED_PRECONDITION (err: %v)", got, err)
+		}
+	})
+}
+
 func TestPromptAgent_RunText(t *testing.T) {
 	ctx := context.Background()
 	reg := setupPromptTestRegistry(t)
@@ -5031,6 +5099,11 @@ func TestAgent_GetSnapshotAction_NoStore(t *testing.T) {
 	if getAction != nil {
 		t.Error("getSnapshot action should NOT be registered without a store")
 	}
+	waitAction := core.ResolveActionFor[*GetSnapshotRequest, *SessionSnapshot[testState], struct{}](
+		reg, api.ActionTypeAgentWait, "noStoreFlow")
+	if waitAction != nil {
+		t.Error("waitForSnapshot action should NOT be registered without a store")
+	}
 	abortAction := core.ResolveActionFor[*AgentAbortRequest, *AgentAbortResponse, struct{}](
 		reg, api.ActionTypeAgentAbort, "noStoreFlow")
 	if abortAction != nil {
@@ -5395,6 +5468,12 @@ func TestAgent_AbortAction_GatedOnCapabilities(t *testing.T) {
 		if getAction == nil {
 			t.Error("getSnapshot action should be registered even when store lacks SnapshotSubscriber")
 		}
+		// Waiting needs no subscription: without one it re-reads the row.
+		waitAction := core.ResolveActionFor[*GetSnapshotRequest, *SessionSnapshot[testState], struct{}](
+			reg, api.ActionTypeAgentWait, "minCaps")
+		if waitAction == nil {
+			t.Error("waitForSnapshot action should be registered even when store lacks SnapshotSubscriber")
+		}
 		abortAction := core.ResolveActionFor[*AgentAbortRequest, *AgentAbortResponse, struct{}](
 			reg, api.ActionTypeAgentAbort, "minCaps")
 		if abortAction != nil {
@@ -5419,29 +5498,38 @@ func TestAgent_CompanionActionAccessors(t *testing.T) {
 		if got := af.GetSnapshotAction(); got != nil {
 			t.Errorf("GetSnapshotAction() = %v, want nil", got)
 		}
+		if got := af.WaitForSnapshotAction(); got != nil {
+			t.Errorf("WaitForSnapshotAction() = %v, want nil", got)
+		}
 		if got := af.AbortAction(); got != nil {
 			t.Errorf("AbortAction() = %v, want nil", got)
 		}
 	})
 
-	t.Run("store without aborter → getSnapshot only", func(t *testing.T) {
+	t.Run("store without aborter → reads and waits, no abort", func(t *testing.T) {
 		reg := newTestRegistry(t)
 		af := DefineCustomAgent(reg, "getOnly", noopFn,
 			WithSessionStore[testState](minimalStore[testState]{}))
 		if af.GetSnapshotAction() == nil {
 			t.Error("GetSnapshotAction() = nil, want action")
 		}
+		if af.WaitForSnapshotAction() == nil {
+			t.Error("WaitForSnapshotAction() = nil, want action")
+		}
 		if got := af.AbortAction(); got != nil {
 			t.Errorf("AbortAction() = %v, want nil", got)
 		}
 	})
 
-	t.Run("aborter store → both, identical to the registered actions", func(t *testing.T) {
+	t.Run("aborter store → all, identical to the registered actions", func(t *testing.T) {
 		reg := newTestRegistry(t)
 		af := DefineCustomAgent(reg, "bothCompanions", noopFn,
 			WithSessionStore(newTestInMemStore[testState]()))
 		if got, want := af.GetSnapshotAction(), reg.LookupAction("/agent-snapshot/bothCompanions"); got == nil || got != want {
 			t.Errorf("GetSnapshotAction() = %v, want registered action %v", got, want)
+		}
+		if got, want := af.WaitForSnapshotAction(), reg.LookupAction("/agent-wait/bothCompanions"); got == nil || got != want {
+			t.Errorf("WaitForSnapshotAction() = %v, want registered action %v", got, want)
 		}
 		if got, want := af.AbortAction(), reg.LookupAction("/agent-abort/bothCompanions"); got == nil || got != want {
 			t.Errorf("AbortAction() = %v, want registered action %v", got, want)
