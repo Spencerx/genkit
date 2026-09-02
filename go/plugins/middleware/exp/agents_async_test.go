@@ -702,8 +702,10 @@ func TestAgentsWaitForUnknownJoinRefused(t *testing.T) {
 
 // TestAgentsAbortBackgroundTask drives the abort control end to end. The task
 // is stopped mid-flight, so the abort has to reach the work and not just the
-// row, and a later check has to agree: an orchestrator told "pending" after it
-// aborted would go back to waiting on work that is gone.
+// row. The abort itself never waits: it answers "did the stop land?", either
+// with the settled row when the worker's finalize won the race or with
+// "aborting" while the task winds down, and the settled, resumable aborted
+// row is collected through the wait tool, which is the flow the tools teach.
 func TestAgentsAbortBackgroundTask(t *testing.T) {
 	g := newTestGenkit(t)
 
@@ -727,8 +729,8 @@ func TestAgentsAbortBackgroundTask(t *testing.T) {
 		aix.WithSessionStore[any](localstore.NewInMemorySessionStore[any]()),
 	)
 
-	// Scripted orchestrator: launch in background, abort, then check that the
-	// abort stuck.
+	// Scripted orchestrator: launch in background, abort, then collect the
+	// settled row through the wait tool.
 	var capturedSystem string
 	orch := toolModel(t, g, "test/orch-abort", func(ctx context.Context, req *ai.ModelRequest, cb ai.ModelStreamCallback) (*ai.ModelResponse, error) {
 		if sys := findSystem(req.Messages); sys != nil {
@@ -736,7 +738,7 @@ func TestAgentsAbortBackgroundTask(t *testing.T) {
 		}
 		launches := toolOutputs(req.Messages, "delegate_to_researcher")
 		aborts := toolOutputs(req.Messages, abortBackgroundTasksToolName)
-		checks := toolOutputs(req.Messages, checkBackgroundTasksToolName)
+		waits := toolOutputs(req.Messages, waitBackgroundTasksToolName)
 		switch {
 		case len(launches) == 0:
 			return toolReqResp(req, &ai.ToolRequest{
@@ -748,9 +750,9 @@ func TestAgentsAbortBackgroundTask(t *testing.T) {
 				Name:  abortBackgroundTasksToolName,
 				Input: map[string]any{"taskIds": []string{lenientDelegation(launches[0]).TaskID}},
 			}), nil
-		case len(checks) == 0:
+		case len(waits) == 0:
 			return toolReqResp(req, &ai.ToolRequest{
-				Name:  checkBackgroundTasksToolName,
+				Name:  waitBackgroundTasksToolName,
 				Input: map[string]any{"taskIds": []string{lenientDelegation(launches[0]).TaskID}},
 			}), nil
 		default:
@@ -777,7 +779,10 @@ func TestAgentsAbortBackgroundTask(t *testing.T) {
 	if len(aborted.Tasks) != 1 {
 		t.Fatalf("expected 1 aborted task, got %+v", aborted.Tasks)
 	}
-	if got := aborted.Tasks[0]; got.Status != string(aix.SnapshotStatusAborted) || got.Error == "" {
+	// The flip's own return decides the report, so stopping a live task
+	// answers "aborting" deterministically: no re-read races the worker's
+	// finalize, and the raw mid-flip window is never exposed.
+	if got := aborted.Tasks[0]; got.Status != string(aix.SnapshotStatusAborting) || got.Error == "" {
 		t.Errorf("unexpected abort report: %+v", got)
 	}
 
@@ -789,13 +794,136 @@ func TestAgentsAbortBackgroundTask(t *testing.T) {
 		t.Error("the sub-agent was never cancelled: the abort reached the row but not the work")
 	}
 
-	checkOuts := toolOutputs(history, checkBackgroundTasksToolName)
-	if len(checkOuts) != 1 {
-		t.Fatalf("expected 1 check response, got %d", len(checkOuts))
+	waitOuts := toolOutputs(history, waitBackgroundTasksToolName)
+	if len(waitOuts) != 1 {
+		t.Fatalf("expected 1 wait response, got %d", len(waitOuts))
 	}
-	checked := decodeToolOutput[backgroundTasksResult](t, checkOuts[0])
-	if len(checked.Tasks) != 1 || checked.Tasks[0].Status != string(aix.SnapshotStatusAborted) {
-		t.Errorf("check after abort: want 1 aborted task, got %+v", checked.Tasks)
+	waited := decodeToolOutput[backgroundTasksResult](t, waitOuts[0])
+	if len(waited.Tasks) != 1 || waited.Tasks[0].Status != string(aix.SnapshotStatusAborted) {
+		t.Fatalf("wait after abort: want 1 settled aborted task, got %+v", waited.Tasks)
+	}
+	if got := waited.Tasks[0].Error; !strings.Contains(got, continueTaskToolName) {
+		t.Errorf("settled aborted report should carry the resume hint, got %q", got)
+	}
+}
+
+// TestAgentsBackgroundLaunchEchoesLabel pins the label plumbing: a
+// caller-chosen name rides the launch result and background-task reports next
+// to the taskId, purely as a reading aid.
+func TestAgentsBackgroundLaunchEchoesLabel(t *testing.T) {
+	g := newTestGenkit(t)
+	genkitx.DefineAgent[any](g, "quick",
+		aix.InlinePrompt{ai.WithModel(toolModel(t, g, "test/quick-label", func(ctx context.Context, req *ai.ModelRequest, cb ai.ModelStreamCallback) (*ai.ModelResponse, error) {
+			return textResp(req, "quick answer"), nil
+		}))},
+		aix.WithSessionStore[any](localstore.NewInMemorySessionStore[any]()),
+	)
+	orch := toolModel(t, g, "test/orch-label", func(ctx context.Context, req *ai.ModelRequest, cb ai.ModelStreamCallback) (*ai.ModelResponse, error) {
+		launches := toolOutputs(req.Messages, "delegate_to_quick")
+		switch {
+		case len(launches) == 0:
+			return toolReqResp(req, &ai.ToolRequest{
+				Name:  "delegate_to_quick",
+				Input: map[string]any{"task": "answer fast", "background": true, "name": "fast-lane"},
+			}), nil
+		case len(toolOutputs(req.Messages, waitBackgroundTasksToolName)) == 0:
+			return toolReqResp(req, &ai.ToolRequest{
+				Name:  waitBackgroundTasksToolName,
+				Input: map[string]any{"taskIds": []string{lenientDelegation(launches[0]).TaskID}},
+			}), nil
+		default:
+			return textResp(req, "done"), nil
+		}
+	})
+	resp, err := genkit.Generate(ctx, g, ai.WithModel(orch), ai.WithPrompt("go"),
+		ai.WithUse(&Agents{Agents: []aix.AgentRef{{Name: "quick"}}, Async: true}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	launch := lenientDelegation(toolOutputs(resp.History(), "delegate_to_quick")[0])
+	if launch.Name != "fast-lane" {
+		t.Errorf("launch result Name = %q, want %q", launch.Name, "fast-lane")
+	}
+	waited := decodeToolOutput[backgroundTasksResult](t, toolOutputs(resp.History(), waitBackgroundTasksToolName)[0])
+	if len(waited.Tasks) != 1 || waited.Tasks[0].Name != "fast-lane" {
+		t.Errorf("report did not echo the label: %+v", waited.Tasks)
+	}
+}
+
+// TestAgentsAbortReportsAbortingWhileWindingDown pins the abort report's
+// honesty without any waiting inside the abort: aborted is a promise the row
+// is settled and resumable, so a worker that has not finalized reports the
+// "aborting" (the stop was delivered, the row is winding down),
+// and the settled aborted row arrives through the wait tool once the worker
+// lets go. That the wait settles at all also proves "aborting" was never
+// cached: a cached report would be returned without following the row.
+func TestAgentsAbortReportsAbortingWhileWindingDown(t *testing.T) {
+	g := newTestGenkit(t)
+
+	// The sub-agent deliberately ignores its cancellation until released, so
+	// the abort's single re-read deterministically finds the row unsettled.
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(unblock)
+	genkitx.DefineCustomAgent[any](g, "stubborn",
+		func(ctx context.Context, resp aix.Responder, sess *aix.SessionRunner[any]) (*aix.AgentResult, error) {
+			err := sess.Run(ctx, func(ctx context.Context, input *aix.AgentInput) (*aix.TurnResult, error) {
+				<-release
+				return nil, errors.New("released")
+			})
+			if err != nil {
+				return nil, err
+			}
+			return &aix.AgentResult{}, nil
+		},
+		aix.WithSessionStore[any](localstore.NewInMemorySessionStore[any]()),
+	)
+
+	orch := toolModel(t, g, "test/orch-stubborn", func(ctx context.Context, req *ai.ModelRequest, cb ai.ModelStreamCallback) (*ai.ModelResponse, error) {
+		launches := toolOutputs(req.Messages, "delegate_to_stubborn")
+		switch {
+		case len(launches) == 0:
+			return toolReqResp(req, &ai.ToolRequest{
+				Name:  "delegate_to_stubborn",
+				Input: map[string]any{"task": "dig in", "background": true},
+			}), nil
+		case len(toolOutputs(req.Messages, abortBackgroundTasksToolName)) == 0:
+			return toolReqResp(req, &ai.ToolRequest{
+				Name:  abortBackgroundTasksToolName,
+				Input: map[string]any{"taskIds": []string{lenientDelegation(launches[0]).TaskID}},
+			}), nil
+		case len(toolOutputs(req.Messages, waitBackgroundTasksToolName)) == 0:
+			// The abort has reported; let the worker wind down and follow the
+			// row to its settled state.
+			unblock()
+			return toolReqResp(req, &ai.ToolRequest{
+				Name:  waitBackgroundTasksToolName,
+				Input: map[string]any{"taskIds": []string{lenientDelegation(launches[0]).TaskID}},
+			}), nil
+		default:
+			return textResp(req, "done"), nil
+		}
+	})
+
+	resp, err := genkit.Generate(ctx, g, ai.WithModel(orch), ai.WithPrompt("go"),
+		ai.WithUse(&Agents{Agents: []aix.AgentRef{{Name: "stubborn"}}, Async: true}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	abortOuts := toolOutputs(resp.History(), abortBackgroundTasksToolName)
+	if len(abortOuts) != 1 {
+		t.Fatalf("expected 1 abort response, got %d", len(abortOuts))
+	}
+	aborted := decodeToolOutput[backgroundTasksResult](t, abortOuts[0])
+	if len(aborted.Tasks) != 1 || aborted.Tasks[0].Status != string(aix.SnapshotStatusAborting) {
+		t.Errorf("abort of an unfinalized task: want an %q report, got %+v", string(aix.SnapshotStatusAborting), aborted.Tasks)
+	} else if got := aborted.Tasks[0].Error; !strings.Contains(got, waitBackgroundTasksToolName) {
+		t.Errorf("the aborting report should point at the wait tool, got %q", got)
+	}
+	waited := decodeToolOutput[backgroundTasksResult](t, toolOutputs(resp.History(), waitBackgroundTasksToolName)[0])
+	if waited.TimedOut || len(waited.Tasks) != 1 || waited.Tasks[0].Status != string(aix.SnapshotStatusAborted) {
+		t.Errorf("wait after abort: want 1 settled aborted task, got %+v", waited)
 	}
 }
 
@@ -840,7 +968,7 @@ func TestAgentsAbortAfterCompletionReportsTheResult(t *testing.T) {
 
 	a := &Agents{Agents: []aix.AgentRef{{Name: "researcher"}}, Async: true}
 	st := &agentsState{settledReports: map[string]backgroundTaskReport{}}
-	got, err := a.reportTask(ctx, g, st, formatTaskID("researcher", task.SnapshotID()), abortSnapshot)
+	got, err := a.reportTask(ctx, g, st, formatTaskID("researcher", task.SnapshotID()), a.abortSnapshot())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -876,7 +1004,7 @@ func TestFoldDelegationNonAnswerReasons(t *testing.T) {
 	} {
 		t.Run(string(reason), func(t *testing.T) {
 			got := a.foldDelegationOutput(t.Context(), ref,
-				&aix.AgentOutput[json.RawMessage]{FinishReason: reason, Message: tip}, "researcher_x")
+				&aix.AgentOutput[json.RawMessage]{FinishReason: reason, Message: tip}, 0)
 			if !strings.Contains(got.Response, "Error calling agent") {
 				t.Errorf("Response = %q, want it reported as a failure", got.Response)
 			}
@@ -896,14 +1024,14 @@ func TestFoldDelegationNonAnswerReasons(t *testing.T) {
 		FinishReason: aix.AgentFinishReasonFailed,
 		Message:      tip,
 		Error:        &status.Error{Status: status.Internal, Message: "upstream model refused"},
-	}, "researcher_x")
+	}, 0)
 	if !strings.Contains(got.Response, "upstream model refused") {
 		t.Errorf("Response = %q, want the structured failure preferred", got.Response)
 	}
 
 	// A reason that does carry a result is untouched.
 	got = a.foldDelegationOutput(t.Context(), ref,
-		&aix.AgentOutput[json.RawMessage]{FinishReason: aix.AgentFinishReasonStop, Message: tip}, "researcher_x")
+		&aix.AgentOutput[json.RawMessage]{FinishReason: aix.AgentFinishReasonStop, Message: tip}, 0)
 	if got.Response != "partial notes: found 3 of 5 sources" {
 		t.Errorf("Response = %q, want the message reported as the answer", got.Response)
 	}
@@ -925,12 +1053,12 @@ func TestFoldDelegationNoFinalMessage(t *testing.T) {
 
 	// A silent success must read as a success, and say where the result is.
 	got := a.foldDelegationOutput(t.Context(), ref,
-		&aix.AgentOutput[json.RawMessage]{FinishReason: aix.AgentFinishReasonStop}, "researcher_x")
+		&aix.AgentOutput[json.RawMessage]{FinishReason: aix.AgentFinishReasonStop}, 0)
 	if !strings.Contains(got.Response, "completed") || !strings.Contains(got.Response, "no final message") || !strings.Contains(got.Response, "no artifacts") {
 		t.Errorf("Response = %q, want a completed-without-message notice naming the missing artifacts", got.Response)
 	}
 	got = a.foldDelegationOutput(t.Context(), ref,
-		&aix.AgentOutput[json.RawMessage]{FinishReason: aix.AgentFinishReasonStop, Message: toolOnly, Artifacts: arts(2)}, "researcher_x")
+		&aix.AgentOutput[json.RawMessage]{FinishReason: aix.AgentFinishReasonStop, Message: toolOnly, Artifacts: arts(2)}, 0)
 	if !strings.Contains(got.Response, "no final message") || !strings.Contains(got.Response, "2 artifacts") {
 		t.Errorf("Response = %q, want the notice to point at the 2 artifacts", got.Response)
 	}
@@ -938,7 +1066,7 @@ func TestFoldDelegationNoFinalMessage(t *testing.T) {
 		t.Errorf("Artifacts = %d, want 2 surfaced alongside the notice", len(got.Artifacts))
 	}
 	got = a.foldDelegationOutput(t.Context(), ref,
-		&aix.AgentOutput[json.RawMessage]{FinishReason: aix.AgentFinishReasonStop, Artifacts: arts(1)}, "researcher_x")
+		&aix.AgentOutput[json.RawMessage]{FinishReason: aix.AgentFinishReasonStop, Artifacts: arts(1)}, 0)
 	if !strings.Contains(got.Response, "one artifact") {
 		t.Errorf("Response = %q, want the notice to point at the one artifact", got.Response)
 	}
@@ -1118,5 +1246,84 @@ func TestBackgroundTaskToolsAcceptNoArguments(t *testing.T) {
 				t.Errorf("Note is empty; want the guidance that tells the model what to pass")
 			}
 		})
+	}
+}
+
+func TestAgentsSyncTaskCheckDoesNotDuplicateArtifacts(t *testing.T) {
+	// A synchronous delegation to a server-managed sub-agent merges its
+	// artifacts under the run's snapshot-based namespace, the same
+	// deterministic one the background-task report path folds under, so
+	// checking the sync result's taskId re-merges over the identical names
+	// instead of duplicating the artifacts in the parent session.
+	g := newTestGenkit(t)
+
+	genkitx.DefineCustomAgent[any](g, "writer",
+		func(ctx context.Context, resp aix.Responder, sess *aix.SessionRunner[any]) (*aix.AgentResult, error) {
+			err := sess.Run(ctx, func(ctx context.Context, input *aix.AgentInput) (*aix.TurnResult, error) {
+				resp.SendArtifact(&aix.Artifact{
+					Name:  "report.md",
+					Parts: []*ai.Part{ai.NewTextPart("the report body")},
+				})
+				sess.AddMessages(ai.NewModelTextMessage("wrote the report"))
+				return &aix.TurnResult{FinishReason: aix.AgentFinishReasonStop}, nil
+			})
+			if err != nil {
+				return nil, err
+			}
+			return &aix.AgentResult{
+				Message:   ai.NewModelTextMessage("wrote the report"),
+				Artifacts: sess.Artifacts(),
+			}, nil
+		},
+		aix.WithSessionStore[any](localstore.NewInMemorySessionStore[any]()),
+	)
+
+	delegating := toolModel(t, g, "test/orch-sync-check", func(ctx context.Context, req *ai.ModelRequest, cb ai.ModelStreamCallback) (*ai.ModelResponse, error) {
+		if len(toolOutputs(req.Messages, checkBackgroundTasksToolName)) > 0 {
+			return textResp(req, "done"), nil
+		}
+		if res, ok := lastDelegationOutput(req.Messages, "delegate_to_writer"); ok {
+			return toolReqResp(req, &ai.ToolRequest{
+				Name:  checkBackgroundTasksToolName,
+				Input: map[string]any{"taskIds": []string{res.TaskID}},
+			}), nil
+		}
+		return toolReqResp(req, &ai.ToolRequest{Name: "delegate_to_writer", Input: map[string]any{"task": "write a report"}}), nil
+	})
+
+	// The orchestrator is itself an agent, so the delegation runs within a
+	// session the artifacts can merge into.
+	orchestrator := genkitx.DefineCustomAgent[any](g, "orchestrator",
+		func(ctx context.Context, resp aix.Responder, sess *aix.SessionRunner[any]) (*aix.AgentResult, error) {
+			var last *ai.Message
+			err := sess.Run(ctx, func(ctx context.Context, input *aix.AgentInput) (*aix.TurnResult, error) {
+				r, err := genkit.Generate(ctx, g,
+					ai.WithModel(delegating),
+					ai.WithMessages(input.Message),
+					ai.WithUse(&Agents{Agents: []aix.AgentRef{{Name: "writer"}}, Async: true}),
+				)
+				if err != nil {
+					return nil, err
+				}
+				last = r.Message
+				return &aix.TurnResult{FinishReason: aix.AgentFinishReasonStop}, nil
+			})
+			if err != nil {
+				return nil, err
+			}
+			return &aix.AgentResult{Message: last, Artifacts: sess.Artifacts()}, nil
+		},
+	)
+
+	out, err := orchestrator.RunText(ctx, "please produce a report")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Artifacts) != 1 {
+		t.Fatalf("expected exactly 1 merged artifact after check, got %v", artifactNames(out.Artifacts))
+	}
+	name := out.Artifacts[0].Name
+	if !strings.HasPrefix(name, "writer_") || !strings.HasSuffix(name, "/report.md") || name == "writer_1/report.md" {
+		t.Errorf("artifact name = %q, want the snapshot-based \"writer_<snap>/report.md\" namespace", name)
 	}
 }

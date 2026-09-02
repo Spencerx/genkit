@@ -448,8 +448,8 @@ func TestAgentHandle_AbortLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Abort: %v", err)
 	}
-	if got != SnapshotStatusAborted {
-		t.Fatalf("Abort status = %q, want %q", got, SnapshotStatusAborted)
+	if got != SnapshotStatusAborting {
+		t.Fatalf("Abort status = %q, want %q: the stop landed and the row settles on the finalize", got, SnapshotStatusAborting)
 	}
 
 	final, err := task.Wait(context.Background())
@@ -473,6 +473,98 @@ func TestAgentHandle_AbortLifecycle(t *testing.T) {
 	// action; the in-process chain keeps the sentinel matchable.
 	if _, err := h.Abort(context.Background(), "does-not-exist"); !errors.Is(err, ErrSnapshotNotFound) {
 		t.Fatalf("Abort(unknown) error = %v, want ErrSnapshotNotFound", err)
+	}
+}
+
+func TestAgentHandle_GetSnapshotMetadataOnly(t *testing.T) {
+	// The metadata read shapes exactly as the full read and drops only the
+	// state payload: a settled row reports its status with a nil State, and a
+	// row inside the abort wind-down window reads as aborting through both.
+	reg := newTestRegistry(t)
+	store := newTestInMemStore[testState]()
+	af := defineLastGoodTestAgent(reg, "metaRead", WithSessionStore(store))
+
+	out, err := af.RunText(context.Background(), "first")
+	if err != nil {
+		t.Fatalf("RunText: %v", err)
+	}
+	h := LookupAgent(reg, "metaRead")
+
+	full, err := h.GetSnapshot(context.Background(), out.SnapshotID)
+	if err != nil {
+		t.Fatalf("GetSnapshot: %v", err)
+	}
+	if full.State == nil {
+		t.Fatal("full read returned no state")
+	}
+	meta, err := h.GetSnapshot(context.Background(), out.SnapshotID, WithMetadataOnly())
+	if err != nil {
+		t.Fatalf("GetSnapshot(WithMetadataOnly): %v", err)
+	}
+	if meta.State != nil {
+		t.Errorf("meta read returned state: %+v", meta.State)
+	}
+	if meta.Status != full.Status || meta.SessionID != full.SessionID || meta.FinishReason != full.FinishReason {
+		t.Errorf("meta read shaped differently from the full read: meta=%+v full=%+v", meta, full)
+	}
+
+	// The option rides every read surface: latest-by-session, and a task poll.
+	latestMeta, err := h.GetLatestSnapshot(context.Background(), out.SessionID, WithMetadataOnly())
+	if err != nil {
+		t.Fatalf("GetLatestSnapshot(WithMetadataOnly): %v", err)
+	}
+	if latestMeta.State != nil {
+		t.Errorf("latest meta read returned state: %+v", latestMeta.State)
+	}
+	polled, err := h.Task(out.SnapshotID).Poll(context.Background(), WithMetadataOnly())
+	if err != nil {
+		t.Fatalf("Poll(WithMetadataOnly): %v", err)
+	}
+	if polled.State != nil {
+		t.Errorf("meta poll returned state: %+v", polled.State)
+	}
+
+	// Shaping needs only the metadata, so a winding-down row tells the same
+	// status story through both reads: aborting while its beat is live, and
+	// expired once the beat is stale.
+	beat := time.Now()
+	saveAborting := func(beat time.Time) string {
+		t.Helper()
+		row, err := store.SaveSnapshot(context.Background(), "",
+			func(_ *SessionSnapshot[testState]) (*SessionSnapshot[testState], error) {
+				return &SessionSnapshot[testState]{
+					SessionID:   "sess-window",
+					Status:      SnapshotStatusAborting,
+					CreatedAt:   beat,
+					UpdatedAt:   beat,
+					HeartbeatAt: &beat,
+				}, nil
+			})
+		if err != nil {
+			t.Fatalf("SaveSnapshot aborting row: %v", err)
+		}
+		return row.SnapshotID
+	}
+	for _, tc := range []struct {
+		name string
+		beat time.Time
+		want SnapshotStatus
+	}{
+		{"live beat", beat, SnapshotStatusAborting},
+		{"stale beat", beat.Add(-2 * defaultHeartbeatTimeout), SnapshotStatusExpired},
+	} {
+		id := saveAborting(tc.beat)
+		metaRow, err := h.GetSnapshot(context.Background(), id, WithMetadataOnly())
+		if err != nil {
+			t.Fatalf("GetSnapshot(%s, WithMetadataOnly): %v", tc.name, err)
+		}
+		fullRow, err := h.GetSnapshot(context.Background(), id)
+		if err != nil {
+			t.Fatalf("GetSnapshot(%s): %v", tc.name, err)
+		}
+		if metaRow.Status != tc.want || fullRow.Status != tc.want {
+			t.Errorf("%s: meta status = %q, full status = %q, want both %q", tc.name, metaRow.Status, fullRow.Status, tc.want)
+		}
 	}
 }
 
@@ -760,5 +852,77 @@ func TestAgentHandle_MetadataKeepsEagerValue(t *testing.T) {
 		if got == nil || got.StateManagement != AgentStateManagementServer || !got.Abortable {
 			t.Fatalf("Metadata() call %d = %+v, want the eagerly set metadata kept", i+1, got)
 		}
+	}
+}
+
+// metadataCountingStore layers [SnapshotMetadataReader] on the test store and
+// counts which read path answers, so a test can tell the capability from the
+// fallback.
+type metadataCountingStore struct {
+	*testInMemStore[testState]
+	fullReads, metadataReads, latestFullReads, latestMetadataReads int
+}
+
+func (s *metadataCountingStore) GetSnapshot(ctx context.Context, snapshotID string) (*SessionSnapshot[testState], error) {
+	s.fullReads++
+	return s.testInMemStore.GetSnapshot(ctx, snapshotID)
+}
+
+func (s *metadataCountingStore) GetLatestSnapshot(ctx context.Context, sessionID string) (*SessionSnapshot[testState], error) {
+	s.latestFullReads++
+	return s.testInMemStore.GetLatestSnapshot(ctx, sessionID)
+}
+
+func (s *metadataCountingStore) GetSnapshotMetadata(ctx context.Context, snapshotID string) (*SessionSnapshot[testState], error) {
+	s.metadataReads++
+	snap, err := s.testInMemStore.GetSnapshot(ctx, snapshotID)
+	if snap != nil {
+		snap.State = nil
+	}
+	return snap, err
+}
+
+func (s *metadataCountingStore) GetLatestSnapshotMetadata(ctx context.Context, sessionID string) (*SessionSnapshot[testState], error) {
+	s.latestMetadataReads++
+	snap, err := s.testInMemStore.GetLatestSnapshot(ctx, sessionID)
+	if snap != nil {
+		snap.State = nil
+	}
+	return snap, err
+}
+
+func TestAgentHandle_MetadataOnlyPrefersTheStoreCapability(t *testing.T) {
+	// A metadata-only read takes SnapshotMetadataReader when the store offers
+	// it, for both addressings, and never touches the full read. The
+	// fallback, a full read with the state dropped, is what every other test
+	// in this package exercises through testInMemStore, which lacks the
+	// capability (see TestAgentHandle_GetSnapshotMetadataOnly).
+	reg := newTestRegistry(t)
+	store := &metadataCountingStore{testInMemStore: newTestInMemStore[testState]()}
+	af := defineLastGoodTestAgent(reg, "metaCapability", WithSessionStore(store))
+	out, err := af.RunText(context.Background(), "first")
+	if err != nil {
+		t.Fatalf("RunText: %v", err)
+	}
+	store.fullReads, store.metadataReads, store.latestFullReads, store.latestMetadataReads = 0, 0, 0, 0
+
+	h := LookupAgent(reg, "metaCapability")
+	meta, err := h.GetSnapshot(context.Background(), out.SnapshotID, WithMetadataOnly())
+	if err != nil {
+		t.Fatalf("GetSnapshot(WithMetadataOnly): %v", err)
+	}
+	if meta.State != nil || meta.Status != SnapshotStatusCompleted {
+		t.Errorf("metadata read = status %q state %v, want completed with no state", meta.Status, meta.State)
+	}
+	latest, err := h.GetLatestSnapshot(context.Background(), out.SessionID, WithMetadataOnly())
+	if err != nil {
+		t.Fatalf("GetLatestSnapshot(WithMetadataOnly): %v", err)
+	}
+	if latest.State != nil || latest.SnapshotID != out.SnapshotID {
+		t.Errorf("latest metadata read = %+v, want the run's snapshot with no state", latest)
+	}
+	if store.metadataReads != 1 || store.latestMetadataReads != 1 || store.fullReads != 0 || store.latestFullReads != 0 {
+		t.Errorf("reads: metadata=%d latestMetadata=%d full=%d latestFull=%d, want the capability path only (1, 1, 0, 0)",
+			store.metadataReads, store.latestMetadataReads, store.fullReads, store.latestFullReads)
 	}
 }

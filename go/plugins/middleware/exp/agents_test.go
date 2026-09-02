@@ -26,6 +26,7 @@ import (
 
 	"github.com/firebase/genkit/go/ai"
 	aix "github.com/firebase/genkit/go/ai/exp"
+	"github.com/firebase/genkit/go/ai/exp/localstore"
 	"github.com/firebase/genkit/go/core/status"
 	"github.com/firebase/genkit/go/genkit"
 	genkitx "github.com/firebase/genkit/go/genkit/exp"
@@ -418,6 +419,173 @@ func TestAgentsSubAgentFailureReported(t *testing.T) {
 	got := delegationResponses(t, resp.History(), "delegate_to_researcher")
 	if len(got) != 1 || !strings.Contains(got[0].Response, "Error calling agent") {
 		t.Fatalf("expected an error delegation response, got %+v", got)
+	}
+}
+
+func TestAgentsSyncDelegationCarriesTaskHandle(t *testing.T) {
+	// A synchronous delegation to a server-managed sub-agent settles with the
+	// run's last committed snapshot on the output, and the result stamps it as
+	// the same "<agent>:<snapshotId>" handle background delegations mint, plus
+	// the outcome. The handle is what lets the orchestrator address the run
+	// after the fact (check it, resume it) instead of only reading its text.
+	g := newTestGenkit(t)
+
+	genkitx.DefineAgent[any](g, "keeper",
+		aix.InlinePrompt{ai.WithModel(toolModel(t, g, "test/keeper", func(ctx context.Context, req *ai.ModelRequest, cb ai.ModelStreamCallback) (*ai.ModelResponse, error) {
+			return textResp(req, "kept"), nil
+		}))},
+		aix.WithSessionStore[any](localstore.NewInMemorySessionStore[any]()),
+	)
+
+	orch := delegateOnceModel(t, g, "test/orch", "delegate_to_keeper", "keep X")
+	mw := &Agents{Agents: []aix.AgentRef{{Name: "keeper"}}}
+
+	resp, err := genkit.Generate(ctx, g, ai.WithModel(orch), ai.WithPrompt("go"), ai.WithUse(mw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := delegationResponses(t, resp.History(), "delegate_to_keeper")
+	if len(got) != 1 {
+		t.Fatalf("expected 1 delegation response, got %d", len(got))
+	}
+	if got[0].Response != "kept" {
+		t.Errorf("Response = %q, want %q", got[0].Response, "kept")
+	}
+	if !strings.HasPrefix(got[0].TaskID, "keeper:") || len(got[0].TaskID) <= len("keeper:") {
+		t.Errorf("TaskID = %q, want \"keeper:<snapshotId>\"", got[0].TaskID)
+	}
+	if got[0].Status != string(aix.SnapshotStatusCompleted) {
+		t.Errorf("Status = %q, want %q", got[0].Status, aix.SnapshotStatusCompleted)
+	}
+}
+
+func TestAgentsSyncFailureCarriesTaskHandle(t *testing.T) {
+	// A server-managed sub-agent that fails still committed what it could, and
+	// the failed run's last snapshot is its resume point. The failure result
+	// carries that handle and the "failed" outcome next to the explanatory
+	// text, so the orchestrator holds something actionable, not only prose.
+	g := newTestGenkit(t)
+
+	genkitx.DefineAgent[any](g, "flaky",
+		aix.InlinePrompt{ai.WithModel(toolModel(t, g, "test/flaky", func(ctx context.Context, req *ai.ModelRequest, cb ai.ModelStreamCallback) (*ai.ModelResponse, error) {
+			return nil, errors.New("model melted")
+		}))},
+		aix.WithSessionStore[any](localstore.NewInMemorySessionStore[any]()),
+	)
+
+	orch := delegateOnceModel(t, g, "test/orch", "delegate_to_flaky", "try X")
+	mw := &Agents{Agents: []aix.AgentRef{{Name: "flaky"}}}
+
+	resp, err := genkit.Generate(ctx, g, ai.WithModel(orch), ai.WithPrompt("go"), ai.WithUse(mw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := delegationResponses(t, resp.History(), "delegate_to_flaky")
+	if len(got) != 1 {
+		t.Fatalf("expected 1 delegation response, got %d", len(got))
+	}
+	if !strings.Contains(got[0].Response, "model melted") {
+		t.Errorf("Response = %q, want the failure text", got[0].Response)
+	}
+	if !strings.HasPrefix(got[0].TaskID, "flaky:") || len(got[0].TaskID) <= len("flaky:") {
+		t.Errorf("TaskID = %q, want \"flaky:<snapshotId>\"", got[0].TaskID)
+	}
+	if got[0].Status != string(aix.SnapshotStatusFailed) {
+		t.Errorf("Status = %q, want %q", got[0].Status, aix.SnapshotStatusFailed)
+	}
+}
+
+func TestAgentsClientManagedDelegationNotContinuable(t *testing.T) {
+	// A client-managed sub-agent persists nothing, so its settled result
+	// carries no task handle, and the continue tool refuses a handle naming it:
+	// only server-managed sub-agents leave resume points behind.
+	g := newTestGenkit(t)
+
+	genkitx.DefineAgent[any](g, "ephemeral",
+		aix.InlinePrompt{ai.WithModel(toolModel(t, g, "test/ephemeral", func(ctx context.Context, req *ai.ModelRequest, cb ai.ModelStreamCallback) (*ai.ModelResponse, error) {
+			return textResp(req, "done here"), nil
+		}))},
+	)
+
+	orch := toolModel(t, g, "test/orch", func(ctx context.Context, req *ai.ModelRequest, cb ai.ModelStreamCallback) (*ai.ModelResponse, error) {
+		delegations := toolOutputs(req.Messages, "delegate_to_ephemeral")
+		resumes := toolOutputs(req.Messages, "continue_task")
+		switch {
+		case len(delegations) == 0:
+			return toolReqResp(req, &ai.ToolRequest{Name: "delegate_to_ephemeral", Input: map[string]any{"task": "do X"}}), nil
+		case len(resumes) == 0:
+			return toolReqResp(req, &ai.ToolRequest{Name: "continue_task",
+				Input: map[string]any{"taskId": "ephemeral:whatever"}}), nil
+		default:
+			return textResp(req, "done"), nil
+		}
+	})
+	// A server-managed sibling keeps the continue tool registered, so the
+	// refusal (and not a missing tool) is what answers the model.
+	genkitx.DefineAgent[any](g, "keeper",
+		aix.InlinePrompt{ai.WithModel(toolModel(t, g, "test/keeper", func(ctx context.Context, req *ai.ModelRequest, cb ai.ModelStreamCallback) (*ai.ModelResponse, error) {
+			return textResp(req, "kept"), nil
+		}))},
+		aix.WithSessionStore[any](localstore.NewInMemorySessionStore[any]()),
+	)
+	mw := &Agents{Agents: []aix.AgentRef{{Name: "ephemeral"}, {Name: "keeper"}}}
+
+	resp, err := genkit.Generate(ctx, g, ai.WithModel(orch), ai.WithPrompt("go"), ai.WithUse(mw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := delegationResponses(t, resp.History(), "delegate_to_ephemeral")
+	if len(got) != 1 {
+		t.Fatalf("expected 1 delegation response, got %d", len(got))
+	}
+	if got[0].TaskID != "" || got[0].Status != "" {
+		t.Errorf("client-managed result carries a handle: taskId=%q status=%q", got[0].TaskID, got[0].Status)
+	}
+	resumes := delegationResponses(t, resp.History(), "continue_task")
+	if len(resumes) != 1 || !strings.Contains(resumes[0].Response, "cannot be continued") {
+		t.Fatalf("expected the client-managed continue refusal, got %+v", resumes)
+	}
+}
+
+func TestAgentsTwoClientManagedInstancesCoexist(t *testing.T) {
+	// The shared resume tool is registered only when a configured sub-agent
+	// can leave a handle behind, so two default-configured instances whose
+	// sub-agents are all client-managed register no shared names, coexist on
+	// one generate call, and omit the resume guidance from the prompt.
+	g := newTestGenkit(t)
+	for _, name := range []string{"alpha", "beta"} {
+		genkitx.DefineAgent[any](g, name,
+			aix.InlinePrompt{ai.WithModel(toolModel(t, g, "test/"+name, func(ctx context.Context, req *ai.ModelRequest, cb ai.ModelStreamCallback) (*ai.ModelResponse, error) {
+				return textResp(req, "ok"), nil
+			}))},
+		)
+	}
+
+	var capturedSystem string
+	orch := toolModel(t, g, "test/orch-two", func(ctx context.Context, req *ai.ModelRequest, cb ai.ModelStreamCallback) (*ai.ModelResponse, error) {
+		if sys := findSystem(req.Messages); sys != nil {
+			capturedSystem = sys.Text()
+		}
+		if len(toolOutputs(req.Messages, "delegate_to_alpha")) == 0 {
+			return toolReqResp(req, &ai.ToolRequest{Name: "delegate_to_alpha", Input: map[string]any{"task": "go"}}), nil
+		}
+		return textResp(req, "done"), nil
+	})
+
+	resp, err := genkit.Generate(ctx, g, ai.WithModel(orch), ai.WithPrompt("go"),
+		ai.WithUse(
+			&Agents{Agents: []aix.AgentRef{{Name: "alpha"}}},
+			&Agents{Agents: []aix.AgentRef{{Name: "beta"}}},
+		))
+	if err != nil {
+		t.Fatalf("two client-managed instances on one call: %v", err)
+	}
+	got := delegationResponses(t, resp.History(), "delegate_to_alpha")
+	if len(got) != 1 || got[0].Response != "ok" {
+		t.Fatalf("delegation through the first instance failed: %+v", got)
+	}
+	if strings.Contains(capturedSystem, continueTaskToolName) {
+		t.Errorf("system prompt advertises the unregistered resume tool: %q", capturedSystem)
 	}
 }
 

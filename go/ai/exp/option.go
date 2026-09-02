@@ -372,3 +372,44 @@ func resolveInvocationInit[State any](name string, opts []InvocationOption[State
 		State:      invOpts.state,
 	}, nil
 }
+
+// --- SnapshotReadOption ---
+
+// SnapshotReadOption configures how a snapshot read projects its result. It
+// applies to the reads that answer at once: [Agent.GetSnapshot],
+// [Agent.GetLatestSnapshot], their [AgentHandle] twins, and [DetachedTask.Poll].
+type SnapshotReadOption interface {
+	applySnapshotRead(*GetSnapshotRequest)
+}
+
+type snapshotReadOptions struct {
+	metadataOnly bool
+}
+
+func (o snapshotReadOptions) applySnapshotRead(req *GetSnapshotRequest) {
+	if o.metadataOnly {
+		req.MetadataOnly = true
+	}
+}
+
+// WithMetadataOnly reads a snapshot's metadata only: the returned snapshot
+// carries the shaped status, finish reason, parent, session, timestamps, and
+// error, and its State is nil. The shaping is identical to a full read (status
+// defaulting and heartbeat expiry need only the metadata), and a store that
+// implements [SnapshotMetadataReader] answers without loading the state at
+// all; any other store is read in full and the state dropped. Use it to
+// dispatch on where a task stands without serializing a potentially large
+// conversation history; the state transform does not run, exactly as on a
+// full read of a stateless row.
+func WithMetadataOnly() SnapshotReadOption {
+	return snapshotReadOptions{metadataOnly: true}
+}
+
+// resolveSnapshotRead applies opts to req and returns it, for the handle
+// methods that answer a read with one wire request.
+func resolveSnapshotRead(req *GetSnapshotRequest, opts []SnapshotReadOption) *GetSnapshotRequest {
+	for _, opt := range opts {
+		opt.applySnapshotRead(req)
+	}
+	return req
+}

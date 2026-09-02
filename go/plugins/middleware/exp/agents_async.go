@@ -64,9 +64,19 @@ const (
 
 // taskStatusUnknown is the report status for a task that could not be resolved
 // (malformed ID, unconfigured agent, missing snapshot, or read error). It is
-// terminal for waiting purposes: pending is the only status that can still
-// change on its own.
+// terminal for waiting purposes: it only arrives once a read failure was
+// classified unhelpable.
 const taskStatusUnknown = "unknown"
+
+// reportSettled reports whether a task report's status can no longer change on
+// its own, which is the rule the wait tool counts by. Report statuses are the
+// runtime's snapshot statuses plus taskStatusUnknown, and the runtime's own
+// rule ([aix.SnapshotStatus.Terminal]) decides for all of them: a pending row
+// and an aborting one (winding down toward its finalize) are the two still in
+// flight, and unknown, like every other status, is settled (see above).
+func reportSettled(reportStatus string) bool {
+	return aix.SnapshotStatus(reportStatus).Terminal()
+}
 
 // noTaskIDsNote is the guidance returned when a background-task tool is called
 // without task IDs.
@@ -79,10 +89,12 @@ const (
 )
 
 // asyncDelegateInput is the delegation tool input when [Agents.Async] is set:
-// the plain task plus the background flag.
+// the plain input plus the background flag. The embedded struct keeps one
+// description of task and name, so the two tool modes cannot teach the model
+// two different delegation shapes.
 type asyncDelegateInput struct {
-	Task       string `json:"task" jsonschema_description:"A clear, self-contained description of the task to delegate."`
-	Background bool   `json:"background,omitempty" jsonschema_description:"Run the delegation in the background. The tool returns immediately with a taskId; collect the result later with check_background_tasks or wait_for_background_tasks."`
+	delegateInput
+	Background bool `json:"background,omitempty" jsonschema_description:"Run the delegation in the background. The tool returns immediately with a taskId; collect the result later with check_background_tasks or wait_for_background_tasks."`
 }
 
 // backgroundTasksInput is the input of the check and abort tools: a bare list
@@ -119,11 +131,16 @@ type backgroundTaskReport struct {
 	TaskID string `json:"taskId"`
 	// Agent is the sub-agent running the task.
 	Agent string `json:"agent,omitempty"`
+	// Name is the caller-chosen label of the delegation behind TaskID, when
+	// one was given in this generate call (see delegateInput.Name).
+	Name string `json:"name,omitempty"`
 	// Status is the task's lifecycle state: "pending", "completed", "failed",
-	// "aborted", "expired" (worker presumed dead), or "unknown" (the ID could
-	// not be resolved; see Error). It answers what the reader must act on
-	// rather than mirroring the stored row, so a task that committed without
-	// producing an answer reports "failed" and explains itself in Error.
+	// "aborted", "expired" (worker presumed dead), "aborting" (the stop was
+	// delivered and the task is winding down toward "aborted"), or "unknown"
+	// (the ID could not be resolved; see Error). It
+	// answers what the reader must act on rather than mirroring the stored
+	// row, so a task that committed without producing an answer reports
+	// "failed" and explains itself in Error.
 	// "completed" always carries a Response.
 	Status string `json:"status"`
 	// Response is the sub-agent's final text response, for completed tasks.
@@ -153,9 +170,9 @@ type backgroundTasksResult struct {
 func (a *Agents) delegateAsync(ref aix.AgentRef, st *agentsState) func(context.Context, asyncDelegateInput) (delegationResult, error) {
 	return func(ctx context.Context, in asyncDelegateInput) (delegationResult, error) {
 		if !in.Background {
-			return a.runDelegation(ctx, ref, st, in.Task)
+			return a.runDelegation(ctx, ref, st, in.Task, in.Name)
 		}
-		return a.launchDelegation(ctx, ref, st, in.Task)
+		return a.launchDelegation(ctx, ref, st, in.Task, in.Name)
 	}
 }
 
@@ -166,86 +183,128 @@ func (a *Agents) delegateAsync(ref aix.AgentRef, st *agentsState) func(context.C
 // slot, so the synchronous fallback it hints at is not refused by a cap the
 // refusal consumed. History is never forwarded: detach requires a
 // server-managed sub-agent, and server-managed init rejects seeded state.
-func (a *Agents) launchDelegation(ctx context.Context, ref aix.AgentRef, st *agentsState, task string) (delegationResult, error) {
+func (a *Agents) launchDelegation(ctx context.Context, ref aix.AgentRef, st *agentsState, task, name string) (delegationResult, error) {
 	invocationNum, _, agent, refusal := a.beginDelegation(ctx, ref, st)
 	if refusal != nil {
 		return *refusal, nil
 	}
-
-	// Pre-flight detach capability from the agent's own metadata: Abortable
-	// is derived at definition time from exactly the store conditions the
-	// runtime's detach check enforces, so a genkit-defined agent that cannot
-	// detach is rejected here deterministically, without a wasted invocation
-	// and without the hedged post-hoc wording below (which remains only for
-	// metadata-less agents).
-	if meta := agent.Metadata(); meta != nil && !meta.Abortable {
-		a.releaseDelegation(st)
-		logger.Warn(ctx, "background launch refused, agent cannot detach", "agent", ref.Name)
-		return delegationResult{Response: fmt.Sprintf(
-			"Error calling agent %q: this agent lacks a session store that supports background work, so it cannot run tasks in the background. Delegate to it without \"background\" instead.",
-			ref.Name)}, nil
+	words := launchWords{
+		errPrefix:         fmt.Sprintf("Error calling agent %q", ref.Name),
+		withoutBackground: "delegate to it without \"background\" instead",
+		started: func(taskID string) string {
+			return fmt.Sprintf("Background task %s started for agent %q.", taskID, ref.Name)
+		},
+		label: name,
 	}
-
-	out, err := runSubAgent(ctx, agent, task, nil, true)
+	if refusal := a.refuseUndetachable(ctx, ref, st, agent, words); refusal != nil {
+		return *refusal, nil
+	}
+	out, err := runSubAgent(ctx, agent, ai.NewUserTextMessage(task), true)
 	if err != nil {
 		logger.Warn(ctx, "background launch failed", "agent", ref.Name, "error", err)
-		return delegationResult{Response: fmt.Sprintf("Error calling agent %q: %v", ref.Name, err)}, nil
+		return delegationResult{Response: fmt.Sprintf("%s: %v", words.errPrefix, err)}, nil
 	}
+	return a.foldDetachOutcome(ctx, ref, st, agent, invocationNum, out, words), nil
+}
 
-	switch out.FinishReason {
-	case aix.AgentFinishReasonDetached:
+// launchWords are the model-facing phrasings that differ between the two
+// background launches, a delegation and a continuation, of the one launch
+// protocol: refuseUndetachable before the run, foldDetachOutcome after it.
+type launchWords struct {
+	// errPrefix opens every refusal: "Error calling agent ..." for a
+	// delegation, "Error continuing task ..." for a continuation.
+	errPrefix string
+	// withoutBackground names the synchronous retry the refusals point at, as
+	// a clause: "delegate to it without \"background\" instead".
+	withoutBackground string
+	// started renders the sentence announcing the pending handle; the tool
+	// hints follow it.
+	started func(taskID string) string
+	// label is the caller-chosen label to stamp on the result (see labelTask).
+	label string
+	// continuedFrom is the handle a continuation picked up, for the launch
+	// log line; empty for a fresh delegation.
+	continuedFrom string
+}
+
+// refuseUndetachable is the pre-flight both background launches run. Abortable
+// is derived at definition time from exactly the store conditions the
+// runtime's detach check enforces, so a genkit-defined agent that cannot
+// detach is refused here deterministically, without a wasted invocation and
+// without the hedged post-hoc wording of foldDetachOutcome (which remains only
+// for metadata-less agents). The refusal names the synchronous retry, so it
+// returns its slot.
+func (a *Agents) refuseUndetachable(ctx context.Context, ref aix.AgentRef, st *agentsState, agent *aix.AgentHandle, words launchWords) *delegationResult {
+	if meta := agent.Metadata(); meta == nil || meta.Abortable {
+		return nil
+	}
+	a.releaseDelegation(st)
+	logger.Warn(ctx, "background launch refused, agent cannot detach", "agent", ref.Name)
+	return &delegationResult{Response: fmt.Sprintf(
+		"%s: this agent lacks a session store that supports background work, so it cannot run in the background; %s.",
+		words.errPrefix, words.withoutBackground)}
+}
+
+// foldDetachOutcome turns the output of a detached run into the launch's tool
+// result: the pending handle when the detach landed, a hedged refusal when a
+// metadata-less agent may have rejected the detach, and the ordinary fold when
+// the run settled before detaching.
+func (a *Agents) foldDetachOutcome(ctx context.Context, ref aix.AgentRef, st *agentsState, agent *aix.AgentHandle, invocationNum int, out *aix.AgentOutput[json.RawMessage], words launchWords) delegationResult {
+	switch {
+	case out.FinishReason == aix.AgentFinishReasonDetached:
 		taskID := formatTaskID(ref.Name, out.SnapshotID)
 		names := a.backgroundToolNames()
-		logger.Debug(ctx, "background task started",
-			"agent", ref.Name, "taskId", taskID, "sessionId", out.SessionID)
-		return delegationResult{
+		attrs := []any{"agent", ref.Name, "taskId", taskID, "sessionId", out.SessionID}
+		if words.continuedFrom != "" {
+			attrs = append(attrs, "continuedFrom", words.continuedFrom)
+		}
+		logger.Debug(ctx, "background task started", attrs...)
+		result := delegationResult{
 			TaskID: taskID,
 			Status: string(aix.SnapshotStatusPending),
-			Response: fmt.Sprintf(
-				"Background task %s started for agent %q. Collect the result with %s or %s, or stop it with %s.",
-				taskID, ref.Name, names.check, names.wait, names.abort),
-		}, nil
-	case aix.AgentFinishReasonFailed:
+			Response: fmt.Sprintf("%s Collect the result with %s or %s, or stop it with %s.",
+				words.started(taskID), names.check, names.wait, names.abort),
+		}
+		a.labelTask(st, &result, words.label)
+		return result
+	case out.FinishReason == aix.AgentFinishReasonFailed && maybeDetachRejection(agent, out):
 		// FAILED_PRECONDITION is how the runtime rejects a detach-incapable
 		// agent (no session store, or one without subscriber support). The
 		// error was decoded from the wire, which keeps only the status name
 		// (never the sentinel), and the status is the runtime's general
 		// precondition category, so the hint is phrased conditionally rather
-		// than asserting the cause. It applies only to metadata-less agents:
-		// a genkit-defined agent that cannot detach was already rejected by
-		// the pre-flight above, so its other FAILED_PRECONDITIONs (e.g. from
-		// the agent fn itself) must not carry a misleading capability hint.
+		// than asserting the cause. Only this failure earns its slot back:
+		// the retry it points at is the synchronous launch, so the cap must
+		// not turn that retry away. Every other failure is the sub-agent's
+		// own, and it ran to produce it, so it counts against the cap, or an
+		// agent that always fails could be launched forever.
 		msg := subAgentFailureMessage(out.FinishReason, out.Error, out.Message)
-		errStatus := ""
-		if out.Error != nil {
-			errStatus = string(out.Error.Status)
-		}
-		logger.Warn(ctx, "background launch rejected",
-			"agent", ref.Name, "status", errStatus, "error", msg)
-		if agent.Metadata() == nil && out.Error != nil && out.Error.Status == status.FailedPrecondition {
-			// Only this failure earns its slot back, and only for an agent
-			// that published no metadata. The retry it points at is the
-			// synchronous delegation, so the cap must not turn that retry
-			// away. Every other failure is the sub-agent's own, and it ran to
-			// produce it, so it counts against the cap or an agent that always
-			// fails could be delegated to forever.
-			//
-			// The metadata check is what keeps the two apart. An agent that
-			// publishes metadata was already refused by the pre-flight above
-			// if it cannot detach, so a FAILED_PRECONDITION arriving here is
-			// by definition not the detach rejection: it came from the agent's
-			// own turn, and refunding it would leave the cap unable to bite.
-			a.releaseDelegation(st)
-			msg += " If this agent lacks a session store that supports background work, delegate to it without \"background\" instead."
-		}
-		return delegationResult{Response: fmt.Sprintf("Error calling agent %q: %s", ref.Name, msg)}, nil
+		logger.Warn(ctx, "background launch rejected", "agent", ref.Name, "error", msg)
+		a.releaseDelegation(st)
+		return delegationResult{Response: fmt.Sprintf(
+			"%s: %s If this agent lacks a session store that supports background work, %s.",
+			words.errPrefix, msg, words.withoutBackground)}
 	default:
-		// The invocation settled before the detach landed; fold it like a
-		// synchronous delegation.
+		// The run settled before the detach landed, or failed on its own;
+		// fold it like a synchronous delegation, handle and all.
 		logger.Debug(ctx, "background launch settled synchronously",
 			"agent", ref.Name, "finishReason", string(out.FinishReason))
-		return a.foldDelegationOutput(ctx, ref, out, fmt.Sprintf("%s_%d", ref.Name, invocationNum)), nil
+		result := a.foldDelegationOutput(ctx, ref, out, invocationNum)
+		a.labelTask(st, &result, words.label)
+		return result
 	}
+}
+
+// maybeDetachRejection reports whether a failed background run may be the
+// runtime's rejection of a detach-incapable agent. Only a metadata-less agent
+// can reach it: one that publishes metadata and cannot detach is refused by
+// the caller's pre-flight, so its own FAILED_PRECONDITIONs must not earn the
+// capability hedge (they came from the agent's turn, and refunding them would
+// leave the cap unable to bite). The rejection was decoded from the wire,
+// which keeps only the status name, so this is a category check and callers
+// phrase their hint conditionally rather than asserting the cause.
+func maybeDetachRejection(agent *aix.AgentHandle, out *aix.AgentOutput[json.RawMessage]) bool {
+	return agent.Metadata() == nil && out.Error != nil && out.Error.Status == status.FailedPrecondition
 }
 
 // backgroundTaskTools builds the shared background-task tools added when
@@ -262,8 +321,8 @@ func (a *Agents) backgroundTaskTools(st *agentsState) []ai.Tool {
 			"Waits until the given background sub-agent tasks finish and returns their results. Set timeoutSeconds to bound the wait; on timeout the current statuses are returned. Set waitFor to \"first\" to return as soon as any one task settles.",
 			a.waitForBackgroundTasks(st)),
 		aix.NewTool(names.abort,
-			"Stops background sub-agent tasks whose results are no longer needed, and returns where that left each one. A task that had already finished is unaffected and reports its result.",
-			a.taskReportTool(st, abortSnapshot)),
+			"Stops background sub-agent tasks whose results are no longer needed, and returns where that left each one. A live task reports \"aborting\" while it winds down and settles as \"aborted\"; a task that had already finished is unaffected and reports its result.",
+			a.taskReportTool(st, a.abortSnapshot())),
 	}
 }
 
@@ -356,11 +415,7 @@ func (a *Agents) waitForBackgroundTasks(st *agentsState) func(context.Context, w
 		res := backgroundTasksResult{Tasks: reports}
 		pending := 0
 		for _, report := range reports {
-			// Terminal() is the same rule the runtime applies, so a status
-			// added there cannot leave this loop counting it as settled.
-			// taskStatusUnknown reads terminal, which is right: it only
-			// arrives once a read failure was classified unhelpable.
-			if !aix.SnapshotStatus(report.Status).Terminal() {
+			if !reportSettled(report.Status) {
 				pending++
 			}
 		}
@@ -433,7 +488,7 @@ func (a *Agents) reportTasks(ctx context.Context, st *agentsState, taskIDs []str
 // collectFirstSettled runs one follow per task concurrently and returns as
 // soon as any of them settles, cancelling the remaining follows so each
 // reports its task as it stands. "Settles" is the same rule the wait loop
-// counts by (Terminal()), unknown included: an unresolvable handle is an
+// counts by (reportSettled), unknown included: an unresolvable handle is an
 // answer the caller must act on, not something to keep waiting behind.
 // Reports come back in input order.
 func (a *Agents) collectFirstSettled(ctx context.Context, g *genkit.Genkit, st *agentsState, taskIDs []string, start time.Time) []backgroundTaskReport {
@@ -453,7 +508,7 @@ func (a *Agents) collectFirstSettled(ctx context.Context, g *genkit.Genkit, st *
 	for range taskIDs {
 		res := <-ch
 		reports[res.i] = res.report
-		if aix.SnapshotStatus(res.report.Status).Terminal() {
+		if reportSettled(res.report.Status) {
 			// The first settle ends the race. Cancelling is idempotent, so
 			// later settles that raced the cancellation just land in their
 			// slots.
@@ -507,19 +562,32 @@ var (
 	awaitSnapshot snapshotFetch = func(ctx context.Context, agent *aix.AgentHandle, snapshotID string) (*aix.SessionSnapshot[json.RawMessage], error) {
 		return agent.WaitForSnapshot(ctx, snapshotID)
 	}
-	// abortSnapshot reads before it stops anything, because there are rows an
-	// abort must not touch. Expiry is decided on read, not stored: a worker
-	// that stopped heartbeating leaves a row that is still pending in the
-	// store and reads as expired. Aborting that row overwrites the one signal
-	// telling the model the work is gone and should be delegated again, and
-	// the report caches as terminal, so nothing later can recover it.
-	//
-	// The read is not an extra cost. A task that already settled needs no
-	// abort at all and is answered from the row alone, which is one dispatch
-	// where aborting first then reading took two. Only a genuinely live task
-	// pays for both, and it is the one the caller asked to stop.
-	abortSnapshot snapshotFetch = func(ctx context.Context, agent *aix.AgentHandle, snapshotID string) (*aix.SessionSnapshot[json.RawMessage], error) {
-		cur, err := agent.GetSnapshot(ctx, snapshotID)
+)
+
+// abortSnapshot builds the abort tool's fetch. It reads before it stops
+// anything, because there are rows an abort must not touch. Expiry is decided
+// on read, not stored: a worker that stopped heartbeating leaves a row that is
+// still pending in the store and reads as expired. Aborting that row
+// overwrites the one signal telling the model the work is gone and should be
+// delegated again, and the report caches as terminal, so nothing later can
+// recover it.
+//
+// The pre-read is metadata-only, since it asks nothing but whether there is
+// anything to stop. A task that already settled needs no abort at all and is
+// answered by one full read of the row; only a genuinely live task pays for
+// the abort, and it is the one the caller asked to stop.
+//
+// The abort never waits: it answers "did the stop land?", and the wait tool is
+// the one tool that waits. The answer comes from Abort's own return, not from
+// a re-read that could fail on its own and turn a delivered stop into
+// "unknown": [aix.SnapshotStatusAborting] means the flip is durable (or was
+// already), so the row read a moment ago is handed back restamped with it, and
+// the report path says the task is winding down toward the settled, resumable
+// row. Any other return means the task settled between the read and the
+// abort, and one full read fetches the answer it now carries.
+func (a *Agents) abortSnapshot() snapshotFetch {
+	return func(ctx context.Context, agent *aix.AgentHandle, snapshotID string) (*aix.SessionSnapshot[json.RawMessage], error) {
+		cur, err := agent.GetSnapshot(ctx, snapshotID, aix.WithMetadataOnly())
 		if err != nil {
 			return nil, err
 		}
@@ -527,26 +595,19 @@ var (
 			// Nothing to stop. Expired, completed, failed and already-aborted
 			// rows each report themselves, which is what the caller needs to
 			// know about a task that outlived the request to cancel it.
-			return cur, nil
+			return agent.GetSnapshot(ctx, snapshotID)
 		}
-		st, err := agent.Abort(ctx, snapshotID)
+		flipped, err := agent.Abort(ctx, snapshotID)
 		if err != nil {
 			return nil, err
 		}
-		if st == aix.SnapshotStatusAborted {
-			// The abort settled the row, and the row just read is the same one
-			// with a new status. Restamping it beats rebuilding a partial
-			// snapshot from the few fields this path happens to need, and it
-			// keeps the abort's own outcome out of reach of a re-read that
-			// could fail on its own.
-			cur.Status = st
+		if flipped == aix.SnapshotStatusAborting {
+			cur.Status = flipped
 			return cur, nil
 		}
-		// The task settled between the read and the abort, so the abort was a
-		// no-op on a terminal row. Re-read for the answer it now carries.
 		return agent.GetSnapshot(ctx, snapshotID)
 	}
-)
+}
 
 // reportTask resolves one task handle, obtains its snapshot through fetch, and
 // shapes the result into a report. Completed tasks surface the sub-agent's
@@ -556,8 +617,8 @@ var (
 // Reports for completed, failed, and aborted tasks are cached on st for the
 // rest of the generate call: those rows never change, so a re-check skips the
 // snapshot fetch and artifact re-merge (and cannot clobber a merged artifact
-// the orchestrator has since edited). Pending, expired, and unresolvable
-// reports can still change on their own and are never cached.
+// the orchestrator has since edited). Pending, aborting, expired, and
+// unresolvable reports can still change on their own and are never cached.
 func (a *Agents) reportTask(ctx context.Context, g *genkit.Genkit, st *agentsState, taskID string, fetch snapshotFetch) (backgroundTaskReport, error) {
 	st.mu.Lock()
 	cached, ok := st.settledReports[taskID]
@@ -572,7 +633,7 @@ func (a *Agents) reportTask(ctx context.Context, g *genkit.Genkit, st *agentsSta
 		return backgroundTaskReport{TaskID: taskID, Status: taskStatusUnknown, Error: err.Error()}, err
 	}
 
-	report := backgroundTaskReport{TaskID: taskID, Agent: ref.Name}
+	report := backgroundTaskReport{TaskID: taskID, Agent: ref.Name, Name: a.taskLabel(st, taskID)}
 	// Both fetches dispatch a companion action of the sub-agent, which applies
 	// the runtime's read shaping: a pending row whose heartbeat went stale is
 	// surfaced as expired.
@@ -580,7 +641,7 @@ func (a *Agents) reportTask(ctx context.Context, g *genkit.Genkit, st *agentsSta
 	// so they are reported separately. Chained, both arrive as NOT_FOUND and
 	// an unregistered agent gets the missing-snapshot advice, which tells the
 	// model to delegate again into a delegation tool that fails identically.
-	agent, err := resolveAgent(g, ref)
+	agent, err := a.agentFrom(g, st, ref)
 	if err != nil {
 		logger.Debug(ctx, "background task agent did not resolve",
 			"taskId", taskID, "agent", ref.Name, "error", err)
@@ -594,18 +655,17 @@ func (a *Agents) reportTask(ctx context.Context, g *genkit.Genkit, st *agentsSta
 		logger.Debug(ctx, "background task read failed",
 			"taskId", taskID, "agent", ref.Name, "error", err)
 		report.Status = taskStatusUnknown
-		// The handle dispatches the companion action in-process, so the error
-		// chain is live and status matching works, subtypes included
-		// (aix.ErrSnapshotNotFound is an ErrNotFound,
-		// aix.ErrSessionStoreNotConfigured an ErrFailedPrecondition). A wait
-		// fetch has already ridden out transient store blips inside the
-		// companion action, so whatever surfaces here is worth reporting. The
-		// agent resolved above, so NOT_FOUND here is the snapshot and nothing
-		// else, and re-delegating is genuinely the way to get the work done.
+		// A wait fetch has already ridden out transient store blips inside
+		// the companion action, so whatever surfaces here is worth reporting.
+		// The agent resolved above, so NOT_FOUND here is the snapshot and
+		// nothing else, and re-delegating is genuinely the way to get the
+		// work done; the other dead ends (see deadEndRead) are reported as
+		// they are, and anything else is presumed transient.
+		s, _ := status.Classified(err)
 		switch {
-		case errors.Is(err, status.ErrNotFound):
+		case s == status.NotFound:
 			report.Error = fmt.Sprintf("No record of this task exists (%v). Delegate the task again if the result is still needed.", err)
-		case errors.Is(err, status.ErrFailedPrecondition), errors.Is(err, status.ErrInvalidArgument):
+		case deadEndRead(err):
 			report.Error = err.Error()
 		default:
 			report.Error = fmt.Sprintf("Could not read the task's status: %v. Check again later.", err)
@@ -633,15 +693,18 @@ func (a *Agents) reportTask(ctx context.Context, g *genkit.Genkit, st *agentsSta
 		if snap.State != nil {
 			arts = snap.State.Artifacts
 		}
-		// Deterministic namespace (unlike the sync path's per-call counter):
-		// AddArtifacts replaces by name, so a re-check after the orchestrator
-		// restarts overwrites the same artifact names instead of duplicating
-		// them.
+		// The output names the row's own snapshot, so the fold namespaces the
+		// artifacts exactly as the synchronous fold of the same run does:
+		// AddArtifacts replaces by name, so a re-check of the same run, in
+		// this call or after the orchestrator restarts, overwrites the same
+		// artifact names instead of duplicating them. The fold also stamps
+		// the handle and the outcome, which this report already carries.
 		folded := a.foldDelegationOutput(ctx, ref, &aix.AgentOutput[json.RawMessage]{
+			SnapshotID:   snapshotID,
 			FinishReason: snap.FinishReason,
 			Message:      tip,
 			Artifacts:    arts,
-		}, fmt.Sprintf("%s_%s", ref.Name, shortSnapshotID(snapshotID)))
+		}, 0)
 		if snap.FinishReason.CarriesResult() {
 			report.Response, report.Artifacts = folded.Response, folded.Artifacts
 		} else {
@@ -650,16 +713,24 @@ func (a *Agents) reportTask(ctx context.Context, g *genkit.Genkit, st *agentsSta
 			// without erroring, which is why the two disagree). Report the
 			// outcome the reader has to act on, not the row's bookkeeping: a
 			// model that sees "completed" moves on and never reads the error.
-			// Which reason it was, and what the agent last said, is in Error.
-			report.Status = string(aix.SnapshotStatusFailed)
+			// Which reason it was, what the agent last said, and how to
+			// continue (an interrupt cannot be) is the folded text, in Error.
+			report.Status = settledStatus(snap.FinishReason)
 			report.Error = folded.Response
 		}
+	case aix.SnapshotStatusAborting:
+		report.Error = fmt.Sprintf(
+			"The stop signal reached the task and it is winding down; its progress is being saved and it will settle as %q. No further action is needed to stop it; collect the settled state with %s if you need it.",
+			aix.SnapshotStatusAborted, a.backgroundToolNames().wait)
 	case aix.SnapshotStatusFailed:
-		report.Error = subAgentFailureMessage(snap.FinishReason, snap.Error, lastModelMessage(snap))
+		report.Error = subAgentFailureMessage(snap.FinishReason, snap.Error, lastModelMessage(snap)) +
+			" The task's progress up to the failure is saved; continue it with " + a.continueToolName() + " using this taskId."
 	case aix.SnapshotStatusAborted:
-		report.Error = "The task was aborted before it finished."
+		report.Error = "The task was aborted before it finished. Continue it with " + a.continueToolName() +
+			" using this taskId to pick up from its last saved progress."
 	case aix.SnapshotStatusExpired:
-		report.Error = "The background worker stopped reporting progress and is presumed dead. Delegate the task again if the result is still needed."
+		report.Error = "The background worker stopped reporting progress and is presumed dead. Attempt " + a.continueToolName() +
+			" with this taskId to recover saved progress, or delegate the task again."
 	}
 
 	// Expired is the one terminal read that can still change its mind: the

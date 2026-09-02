@@ -101,7 +101,8 @@ func resolveAgent(g *genkit.Genkit, ref aix.AgentRef) (*aix.AgentHandle, error) 
 // (default) returns artifact content in the tool result and merges artifacts
 // into the parent session; ArtifactStrategySession merges into the session only
 // and returns names. Merged artifacts are namespaced by an invocation ID
-// (<agent>_<n>/<name>) and tagged with the source agent.
+// (<agent>_<snapshotId prefix>/<name> for a run with a snapshot behind it,
+// <agent>_<n>/<name> otherwise) and tagged with the source agent.
 //
 // If a sub-agent interrupts (e.g. for human input) it is reported back to the
 // orchestrator as a normal tool response, not propagated as an interrupt: there
@@ -164,13 +165,15 @@ type Agents struct {
 	// ToolPrefix is the prefix for generated delegation tool names. A nil value
 	// defaults to "delegate_to" (tools become delegate_to_<agent>); a pointer to
 	// the empty string uses bare agent names. An explicitly set, non-empty
-	// prefix also namespaces the [Agents.Async] background-task tools (e.g.
-	// research_check_background_tasks). Two Async instances in one generate
-	// call therefore need distinct, explicitly set prefixes: left at the
-	// default they both emit the bare background-task tool names, and the
-	// generate call is rejected for duplicate tools. New rejects colliding
-	// names within one instance; it cannot see a sibling.
-	ToolPrefix *string `json:"toolPrefix,omitempty" jsonschema_description:"Prefix for generated delegation tool names. Defaults to \"delegate_to\", so tools become delegate_to_<agent>. Set it to the empty string to use bare agent names. A non-empty prefix also namespaces the async background-task tools."`
+	// prefix also namespaces the shared tools: the [Agents.Async]
+	// background-task tools (e.g. research_check_background_tasks) and the
+	// continue tool (registered whenever any configured sub-agent may be
+	// server-managed). Two instances in one generate call that both register
+	// shared tools therefore need distinct, explicitly set prefixes: left at
+	// the default they emit the same bare names, and the generate call is
+	// rejected for duplicate tools. New rejects colliding names within one
+	// instance; it cannot see a sibling.
+	ToolPrefix *string `json:"toolPrefix,omitempty" jsonschema_description:"Prefix for generated delegation tool names. Defaults to \"delegate_to\", so tools become delegate_to_<agent>. Set it to the empty string to use bare agent names. A non-empty prefix also namespaces the shared background-task and continue tools."`
 	// MaxDelegations caps the number of sub-agent delegations per generate call,
 	// preventing runaway delegation loops. 0 means unlimited.
 	MaxDelegations int `json:"maxDelegations,omitempty" jsonschema_description:"Caps the number of sub-agent delegations per generate call, preventing runaway delegation loops. Defaults to 0, which means unlimited."`
@@ -192,6 +195,10 @@ type Agents struct {
 	// Background delegation requires server-managed sub-agents whose stores
 	// implement [aix.SnapshotSubscriber].
 	Async bool `json:"async,omitempty" jsonschema_description:"Enables background delegation: delegation tools accept a \"background\" flag, and the check_background_tasks / wait_for_background_tasks / abort_background_tasks tools are added. Background delegation requires server-managed sub-agents whose session stores support detach."`
+
+	// TODO: add a knob to disable or scope the continue tool (per agent, or
+	// retries vs follow-ups) once real-world usage shows which control
+	// matters.
 }
 
 func (a Agents) Name() string { return provider + "/agents" }
@@ -214,6 +221,11 @@ type agentsState struct {
 	// conversation is the latest request message list, captured each turn for
 	// optional history forwarding.
 	conversation []*ai.Message
+	// labels holds the caller-chosen delegation labels by task handle, for
+	// echoing on background-task reports. It is a per-call reading aid: after
+	// a restart the transcript still pairs each label with its taskId at the
+	// delegation that minted it.
+	labels map[string]string
 	// settledReports caches terminal background-task reports by task ID for
 	// the rest of the generate call: completed, failed, and aborted rows
 	// never change, so later re-checks skip the snapshot fetch and artifact
@@ -221,6 +233,13 @@ type agentsState struct {
 	// since edited). Pending, expired, and unresolvable reports are never
 	// cached; those can still change.
 	settledReports map[string]backgroundTaskReport
+	// agents holds the handles New resolved for the configured sub-agents,
+	// by name. The registry is fixed for the generate call, so resolving once
+	// spares every delegation and task report a lookup plus a fresh handle
+	// whose metadata (a deep copy of the agent's state schema) would be
+	// derived again. Written once by New and read-only afterwards; an agent
+	// absent here is resolved on demand (see agentFrom).
+	agents map[string]*aix.AgentHandle
 }
 
 // New validates the configuration and returns the hooks: a delegation tool per
@@ -239,7 +258,10 @@ func (a Agents) New(ctx context.Context) (*ai.Hooks, error) {
 	}
 
 	prefix := a.prefix()
-	st := &agentsState{settledReports: make(map[string]backgroundTaskReport)}
+	st := &agentsState{
+		settledReports: make(map[string]backgroundTaskReport),
+		labels:         make(map[string]string),
+	}
 
 	// Every generated tool name is validated against the set as it is built:
 	// a collision (two agents mapping to one delegation tool name, or a
@@ -282,13 +304,36 @@ func (a Agents) New(ctx context.Context) (*ai.Hooks, error) {
 		}
 		tools = append(tools, a.backgroundTaskTools(st)...)
 	}
+	// The continue tool is registered only where it can ever succeed: a
+	// server-managed sub-agent leaves durable "<agent>:<snapshotId>" handles
+	// behind, and those handles are the currency the tool spends. A
+	// configuration whose sub-agents are all provably client-managed gets no
+	// continue tool (and no mention of it in the system prompt), which also
+	// keeps two default-configured instances of this middleware from
+	// colliding on the shared bare name when neither has anything to continue.
+	// Like the delegation tools, its input schema depends on whether
+	// background execution exists.
+	g := genkit.FromContext(ctx)
+	st.agents = a.resolveHandles(g)
+	continuable := a.anyContinuableAgent(st.agents)
+	if continuable {
+		continueName := a.continueToolName()
+		if err := claimName(continueName, "the continue tool"); err != nil {
+			return nil, err
+		}
+		if a.Async {
+			tools = append(tools, aix.NewTool(continueName, continueToolDescription, a.continueTaskAsync(st)))
+		} else {
+			tools = append(tools, aix.NewTool(continueName, continueToolDescription, a.continueTask(st)))
+		}
+	}
 
 	// The <sub-agents> block depends only on the configuration and the
 	// registry, both fixed for this call, so it is built here rather than per
 	// tool-loop turn: New already runs exactly once per generate call, and
 	// re-rendering cost a registry lookup and a descriptor copy per agent per
 	// turn to produce a string the injector then dropped as identical.
-	instructions := a.buildInstructions(genkit.FromContext(ctx))
+	instructions := a.buildInstructions(g, continuable)
 
 	wrapGenerate := func(ctx context.Context, params *ai.GenerateParams, next ai.GenerateNext) (*ai.ModelResponse, error) {
 		// Capture the latest messages for optional history forwarding. The
@@ -312,6 +357,9 @@ func (a Agents) New(ctx context.Context) (*ai.Hooks, error) {
 // delegateInput is the input schema for a delegation tool.
 type delegateInput struct {
 	Task string `json:"task" jsonschema_description:"A clear, self-contained description of the task to delegate."`
+	// Name is a caller-chosen reading aid, never identity: the taskId stays
+	// the handle; the label just keeps several concurrent tasks readable.
+	Name string `json:"name,omitempty" jsonschema_description:"Optional short label for this delegation (e.g. \"sources-sweep\"). Echoed on the result and on background-task reports next to the taskId, to keep several tasks readable. Not an identifier."`
 }
 
 // delegationResult is the output of a delegation tool.
@@ -323,13 +371,22 @@ type delegationResult struct {
 	// Artifacts are the sub-agent's artifacts. Content is populated only under
 	// ArtifactStrategyInline.
 	Artifacts []delegatedArtifact `json:"artifacts,omitempty"`
-	// TaskID is the background task handle ("<agent>:<snapshotId>") when the
-	// delegation was started with background=true; empty otherwise. It is the
-	// input to the background-task tools (check, wait, abort).
+	// TaskID is the delegation's handle ("<agent>:<snapshotId>"). For a
+	// background delegation it names the pending task; for a synchronous
+	// delegation to a server-managed sub-agent it names the run's last
+	// committed snapshot, whatever the outcome. It is the input to the
+	// background-task tools (check, wait, abort). Empty when there is nothing
+	// addressable behind the result: a client-managed sub-agent, a run that
+	// committed no turn, or an interrupt.
 	TaskID string `json:"taskId,omitempty"`
-	// Status is "pending" when a background delegation was started; empty for
-	// synchronous delegations.
+	// Status is the outcome behind TaskID: "pending" when a background
+	// delegation was started, and the settled outcome ("completed", "failed",
+	// or "aborted", the vocabulary background-task reports use) for a
+	// synchronous delegation that carries a handle. Empty whenever TaskID is.
 	Status string `json:"status,omitempty"`
+	// Name echoes the caller-chosen label for this delegation, when one was
+	// given (see delegateInput.Name). A continued task keeps its label.
+	Name string `json:"name,omitempty"`
 }
 
 type delegatedArtifact struct {
@@ -343,7 +400,7 @@ type delegatedArtifact struct {
 // agent resolution, sub-agent execution, and artifact merging.
 func (a *Agents) delegate(ref aix.AgentRef, st *agentsState) func(context.Context, delegateInput) (delegationResult, error) {
 	return func(ctx context.Context, in delegateInput) (delegationResult, error) {
-		return a.runDelegation(ctx, ref, st, in.Task)
+		return a.runDelegation(ctx, ref, st, in.Task, in.Name)
 	}
 }
 
@@ -365,7 +422,7 @@ func (a *Agents) beginDelegation(ctx context.Context, ref aix.AgentRef, st *agen
 			"Delegation limit reached (%d). Complete the task using information already gathered.", a.MaxDelegations)}
 	}
 
-	agent, err := resolveAgent(genkit.FromContext(ctx), ref)
+	agent, err := a.agentFrom(genkit.FromContext(ctx), st, ref)
 	if err != nil {
 		logger.Warn(ctx, "sub-agent resolution failed", "agent", ref.Name, "error", err)
 		return 0, nil, nil, &delegationResult{Response: "Error: " + err.Error()}
@@ -376,7 +433,7 @@ func (a *Agents) beginDelegation(ctx context.Context, ref aix.AgentRef, st *agen
 // runDelegation is the synchronous delegation body, shared by the plain
 // delegation tool and the async-enabled variant when the model does not
 // request background execution.
-func (a *Agents) runDelegation(ctx context.Context, ref aix.AgentRef, st *agentsState, task string) (delegationResult, error) {
+func (a *Agents) runDelegation(ctx context.Context, ref aix.AgentRef, st *agentsState, task, name string) (delegationResult, error) {
 	invocationNum, conversation, agent, refusal := a.beginDelegation(ctx, ref, st)
 	if refusal != nil {
 		return *refusal, nil
@@ -393,7 +450,11 @@ func (a *Agents) runDelegation(ctx context.Context, ref aix.AgentRef, st *agents
 	logger.Debug(ctx, "delegating to sub-agent",
 		"agent", ref.Name, "invocation", invocationNum, "historyMessages", len(history))
 	start := time.Now()
-	out, err := runSubAgent(ctx, agent, task, history, false)
+	var opts []aix.InvocationOption[json.RawMessage]
+	if len(history) > 0 {
+		opts = append(opts, aix.WithState(&aix.SessionState[json.RawMessage]{Messages: history}))
+	}
+	out, err := runSubAgent(ctx, agent, ai.NewUserTextMessage(task), false, opts...)
 	if err != nil {
 		// The agent runtime resolves failures and interrupts gracefully (see
 		// foldDelegationOutput), so this only fires for exceptions outside
@@ -404,7 +465,8 @@ func (a *Agents) runDelegation(ctx context.Context, ref aix.AgentRef, st *agents
 		return delegationResult{Response: fmt.Sprintf("Error calling agent %q: %v", ref.Name, err)}, nil
 	}
 
-	result := a.foldDelegationOutput(ctx, ref, out, fmt.Sprintf("%s_%d", ref.Name, invocationNum))
+	result := a.foldDelegationOutput(ctx, ref, out, invocationNum)
+	a.labelTask(st, &result, name)
 	logger.Debug(ctx, "sub-agent delegation finished",
 		"agent", ref.Name, "finishReason", string(out.FinishReason),
 		"durationMs", time.Since(start).Milliseconds(), "artifacts", len(result.Artifacts))
@@ -450,37 +512,79 @@ func (a *Agents) releaseDelegation(st *agentsState) {
 
 // foldDelegationOutput turns a settled sub-agent output into a delegation tool
 // result: interrupts and failures become explanatory text, and artifacts are
-// merged into the parent session under invocationID and surfaced per the
-// configured strategy.
-func (a *Agents) foldDelegationOutput(ctx context.Context, ref aix.AgentRef, out *aix.AgentOutput[json.RawMessage], invocationID string) delegationResult {
+// merged into the parent session and surfaced per the configured strategy.
+//
+// A server-managed output names the run's last committed snapshot, so every
+// settled result but an interrupt is stamped with the same
+// "<agent>:<snapshotId>" handle background delegations mint, plus the outcome
+// it settled in. The handle is what makes a delegation addressable after the
+// fact: the background-task tools accept it, and it is the currency a
+// continuation spends. The same snapshot namespaces the run's artifacts, the
+// deterministic namespace the background-task report path folds under too, so
+// one run merges identical artifact names no matter which path folds it, and
+// AddArtifacts' replace-by-name makes a later re-check of the run's handle
+// idempotent instead of duplicative. A run with no snapshot behind it (a
+// client-managed sub-agent) is namespaced by invocationNum, its per-call
+// invocation number.
+func (a *Agents) foldDelegationOutput(ctx context.Context, ref aix.AgentRef, out *aix.AgentOutput[json.RawMessage], invocationNum int) delegationResult {
 	// Interrupted first: it is one of the reasons that carry no result, and it
-	// is the one with an explanation of its own worth giving.
+	// is the one with an explanation of its own worth giving. It is also the
+	// one settled outcome that carries no handle: continuing past it means
+	// answering the interrupt, which the orchestrator cannot do.
 	if out.FinishReason == aix.AgentFinishReasonInterrupted {
 		// Reported as text, not propagated: there is no stateful sub-agent
 		// runtime to resume into, so the orchestrator could never satisfy it.
 		return delegationResult{Response: interruptedResponse(ref.Name)}
+	}
+	var result delegationResult
+	namespace := fmt.Sprintf("%s_%d", ref.Name, invocationNum)
+	if id := settledSnapshotID(out); id != "" {
+		result.TaskID = formatTaskID(ref.Name, id)
+		result.Status = settledStatus(out.FinishReason)
+		namespace = snapshotNamespace(ref.Name, id)
 	}
 	if !out.FinishReason.CarriesResult() {
 		// Blocked, truncated, aborted, or failed. The turn's last message is
 		// whatever the agent got out before it stopped, so it explains the
 		// outcome rather than answering the task, and reporting it as the
 		// answer would hand the orchestrator partial work as if it were final.
-		return delegationResult{Response: fmt.Sprintf("Error calling agent %q: %s",
-			ref.Name, subAgentFailureMessage(out.FinishReason, out.Error, out.Message))}
+		result.Response = fmt.Sprintf("Error calling agent %q: %s",
+			ref.Name, subAgentFailureMessage(out.FinishReason, out.Error, out.Message))
+		if result.TaskID != "" {
+			result.Response += fmt.Sprintf(
+				" The run's progress up to that point is saved; call %s with this taskId to continue it, optionally with instructions.", a.continueToolName())
+		}
+		return result
 	}
 
 	subArtifacts := namedArtifacts(out.Artifacts)
-	result := delegationResult{Response: messageText(out.Message)}
+	result.Response = messageText(out.Message)
 	if result.Response == "" {
 		result.Response = noFinalMessageResponse(len(subArtifacts))
 	}
 	if len(subArtifacts) > 0 {
 		// Merge into the parent session under both strategies (no-op if there
 		// is no active session, e.g. a plain genkit.Generate call).
-		mergeArtifacts(ctx, ref.Name, invocationID, subArtifacts)
-		result.Artifacts = delegatedArtifacts(invocationID, subArtifacts, a.strategy())
+		mergeArtifacts(ctx, ref.Name, namespace, subArtifacts)
+		result.Artifacts = delegatedArtifacts(namespace, subArtifacts, a.strategy())
 	}
 	return result
+}
+
+// settledSnapshotID returns the snapshot a settled output names, or "" when
+// nothing durable stands behind it: a client-managed run, or a detached one,
+// whose SnapshotID names a pending row rather than a settled turn.
+func settledSnapshotID(out *aix.AgentOutput[json.RawMessage]) string {
+	if out.FinishReason == aix.AgentFinishReasonDetached {
+		return ""
+	}
+	return out.SnapshotID
+}
+
+// snapshotNamespace is the artifact namespace of a server-managed run: the
+// agent's name and the run's snapshot ID, shortened.
+func snapshotNamespace(agentName, snapshotID string) string {
+	return fmt.Sprintf("%s_%s", agentName, shortSnapshotID(snapshotID))
 }
 
 // noFinalMessageResponse is the tool text reported for a run that settled on a
@@ -498,6 +602,61 @@ func noFinalMessageResponse(artifacts int) string {
 	default:
 		return fmt.Sprintf("The task completed, but the agent gave no final message; its result is in the %d artifacts it produced.", artifacts)
 	}
+}
+
+// labelTask stamps the caller-chosen label on a settled result and records it
+// against the result's handle so background-task reports can echo it for the
+// rest of the call. A label with no handle still rides the result (the
+// transcript keeps the pairing); a handle with no label is left alone.
+func (a *Agents) labelTask(st *agentsState, result *delegationResult, name string) {
+	if name == "" {
+		return
+	}
+	result.Name = name
+	if result.TaskID == "" {
+		return
+	}
+	st.mu.Lock()
+	st.labels[result.TaskID] = name
+	st.mu.Unlock()
+}
+
+// taskLabel returns the label recorded for a handle in this call, or "".
+func (a *Agents) taskLabel(st *agentsState, taskID string) string {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.labels[taskID]
+}
+
+// settledStatus maps a settled finish reason onto the snapshot-status
+// vocabulary that delegation results and background-task reports share:
+// "completed" for every reason that carries a result, "aborted" for an
+// aborted run, and "failed" for the rest. A blocked or length-truncated turn
+// commits a completed row, but it carries no answer, and a model told
+// "completed" moves on without reading the explanation; the finish reason
+// itself is named in that explanation.
+func settledStatus(reason aix.AgentFinishReason) string {
+	switch {
+	case reason.CarriesResult():
+		return string(aix.SnapshotStatusCompleted)
+	case reason == aix.AgentFinishReasonAborted:
+		return string(aix.SnapshotStatusAborted)
+	default:
+		return string(aix.SnapshotStatusFailed)
+	}
+}
+
+// deadEndRead reports whether a snapshot read failure cannot be helped by
+// retrying: the row is gone or the request itself is rejected. Anything else
+// (a store blip, a timed-out read) is presumed transient. It is the policy the
+// runtime's own wait applies to its re-reads, matched by status name
+// ([status.Classified]) rather than sentinel identity, per the handle's
+// contract: an error that crossed a wire carries a status name and nothing
+// else, and a subtype classifies as its base ([aix.ErrSnapshotNotFound] is a
+// NOT_FOUND).
+func deadEndRead(err error) bool {
+	s, ok := status.Classified(err)
+	return ok && (s == status.NotFound || s == status.FailedPrecondition || s == status.InvalidArgument)
 }
 
 // interruptedResponse is the tool text reported when a sub-agent interrupted
@@ -533,20 +692,62 @@ func subAgentFailureMessage(reason aix.AgentFinishReason, err *status.Error, las
 	return msg + "."
 }
 
-// runSubAgent runs the agent one-shot with the task. With no history the
-// invocation starts a fresh session; with history the messages ride as
-// client-managed init state ([aix.WithState]), which callers forward only to
-// client-managed agents. With detach set, the input asks the sub-agent
-// runtime to move the work to the background immediately: the returned output
-// then carries the pending snapshot's ID and [aix.AgentFinishReasonDetached]
-// while the sub-agent keeps working. Custom state is json.RawMessage
-// throughout ([aix.AgentHandle]) since the sub-agent's State is unknown here.
-func runSubAgent(ctx context.Context, agent *aix.AgentHandle, task string, history []*ai.Message, detach bool) (*aix.AgentOutput[json.RawMessage], error) {
-	var opts []aix.InvocationOption[json.RawMessage]
-	if len(history) > 0 {
-		opts = append(opts, aix.WithState(&aix.SessionState[json.RawMessage]{Messages: history}))
+// runSubAgent runs one turn of the agent: msg is the turn's user message (nil
+// for a payload-less input), detach asks the sub-agent runtime to move the
+// work to the background immediately (the returned output then carries the
+// pending snapshot's ID and [aix.AgentFinishReasonDetached] while the
+// sub-agent keeps working), and opts name the session source: none for a
+// fresh session, [aix.WithState] for forwarded history (which only
+// client-managed agents accept), [aix.WithSnapshotID] for a continuation.
+// Custom state is json.RawMessage throughout ([aix.AgentHandle]) since the
+// sub-agent's State is unknown here.
+func runSubAgent(ctx context.Context, agent *aix.AgentHandle, msg *ai.Message, detach bool, opts ...aix.InvocationOption[json.RawMessage]) (*aix.AgentOutput[json.RawMessage], error) {
+	return agent.Run(ctx, &aix.AgentInput{Detach: detach, Message: msg}, opts...)
+}
+
+// resolveHandles resolves every configured sub-agent's handle through g, by
+// name. An agent the registry does not hold is left out, and a nil g (New ran
+// outside a generate call) resolves nothing; both are resolved on demand by
+// agentFrom, which is also where a miss is reported.
+func (a *Agents) resolveHandles(g *genkit.Genkit) map[string]*aix.AgentHandle {
+	handles := make(map[string]*aix.AgentHandle, len(a.Agents))
+	if g == nil {
+		return handles
 	}
-	return agent.Run(ctx, &aix.AgentInput{Detach: detach, Message: ai.NewUserTextMessage(task)}, opts...)
+	for _, ref := range a.Agents {
+		if h := genkitx.LookupAgent(g, ref.Name); h != nil {
+			handles[ref.Name] = h
+		}
+	}
+	return handles
+}
+
+// agentFrom returns the handle New resolved for ref (see agentsState.agents),
+// or resolves it through g now, reporting a miss the way every delegation
+// does.
+func (a *Agents) agentFrom(g *genkit.Genkit, st *agentsState, ref aix.AgentRef) (*aix.AgentHandle, error) {
+	if h := st.agents[ref.Name]; h != nil {
+		return h, nil
+	}
+	return resolveAgent(g, ref)
+}
+
+// anyContinuableAgent reports whether any configured sub-agent can leave a
+// continuable task handle behind, which is what justifies registering the
+// shared continue tool: only server-managed sub-agents (those with a session
+// store) commit durable snapshots. An agent that was not resolved (absent
+// from handles), or that publishes no metadata, counts as continuable, the
+// same safe default isClientManaged applies: the tool stays available for an
+// agent that may well have a store, and a wrong guess costs a refusal at call
+// time rather than a silently missing tool.
+func (a *Agents) anyContinuableAgent(handles map[string]*aix.AgentHandle) bool {
+	for _, ref := range a.Agents {
+		h, ok := handles[ref.Name]
+		if !ok || !isClientManaged(h) {
+			return true
+		}
+	}
+	return false
 }
 
 // isClientManaged reports whether the agent owns its state on the client (no
@@ -615,18 +816,24 @@ type taskToolNames struct{ check, wait, abort string }
 // all returns the names in a fixed order, for collision checking.
 func (n taskToolNames) all() []string { return []string{n.check, n.wait, n.abort} }
 
-// backgroundToolNames returns the names of the shared background-task tools
-// for this configuration. They are the bare well-known names by default and
-// prefixed with an explicitly set [Agents.ToolPrefix], so two Async instances
-// with distinct prefixes can coexist on one generate call without colliding
-// on the shared names (the default delegate_to prefix is a delegation verb,
-// not an instance namespace, so it is deliberately not applied here, and a
-// nil prefix is therefore the same as an empty one).
-func (a *Agents) backgroundToolNames() taskToolNames {
-	prefix := ""
+// sharedToolPrefix is the prefix applied to the shared tools (the
+// background-task tools and the continue tool): an explicitly set
+// [Agents.ToolPrefix], and none by default, so two instances with distinct
+// prefixes can coexist on one generate call without colliding on the shared
+// names. The default delegate_to prefix is a delegation verb, not an instance
+// namespace, so it is deliberately not applied here, and a nil prefix is
+// therefore the same as an empty one.
+func (a *Agents) sharedToolPrefix() string {
 	if a.ToolPrefix != nil {
-		prefix = *a.ToolPrefix
+		return *a.ToolPrefix
 	}
+	return ""
+}
+
+// backgroundToolNames returns the names of the shared background-task tools
+// for this configuration (see sharedToolPrefix).
+func (a *Agents) backgroundToolNames() taskToolNames {
+	prefix := a.sharedToolPrefix()
 	return taskToolNames{
 		check: makeToolName(prefix, checkBackgroundTasksToolName),
 		wait:  makeToolName(prefix, waitBackgroundTasksToolName),
@@ -654,8 +861,10 @@ func makeToolName(prefix, agentName string) string {
 // buildInstructions renders the <sub-agents> system prompt block. g may be
 // nil (e.g. outside an agent/Generate context), in which case only configured
 // descriptions are used. With [Agents.Async] set, the block also explains
-// background delegation and names this configuration's background-task tools.
-func (a *Agents) buildInstructions(g *genkit.Genkit) string {
+// background delegation and names this configuration's background-task tools;
+// with continuable set (the continue tool is registered) it explains task handles
+// and the continue tool.
+func (a *Agents) buildInstructions(g *genkit.Genkit, continuable bool) string {
 	prefix := a.prefix()
 	var b strings.Builder
 	b.WriteString("<sub-agents>\n")
@@ -685,6 +894,19 @@ func (a *Agents) buildInstructions(g *genkit.Genkit) string {
 		b.WriteString("tasks whose results are no longer needed. Background tasks keep ")
 		b.WriteString("running across turns, and task IDs from earlier tool results stay ")
 		b.WriteString("valid: check them before delegating the same work again.\n")
+	}
+	if continuable {
+		b.WriteString("\n")
+		b.WriteString("Results of delegations to sub-agents that keep sessions carry a taskId ")
+		b.WriteString("where the sub-agent's progress is addressable. If such a delegation ")
+		b.WriteString("fails or is aborted, its saved progress is not lost: call ")
+		b.WriteString(a.continueToolName() + " with the taskId to continue it from where it ")
+		b.WriteString("stopped, either as-is or steered with instructions. A completed task ")
+		b.WriteString("accepts follow-up instructions in its own session the same way, ")
+		b.WriteString("without repeating the finished work. A task that stopped on an ")
+		b.WriteString("interrupt cannot be continued; delegate a more self-contained task ")
+		b.WriteString("instead. A result without a taskId is not continuable; delegate again ")
+		b.WriteString("to redo that work.\n")
 	}
 	b.WriteString("</sub-agents>")
 	return b.String()
